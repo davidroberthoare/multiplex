@@ -29,6 +29,10 @@ use cuemesh2_shared::{hashing, transfer};
 
 use crate::state::{PlaybackState, SharedState};
 
+/// Keep drift hard-seeks this far from a clip's end so we always land on real
+/// media rather than triggering EOS.
+const SEEK_MARGIN_MS: u64 = 250;
+
 pub struct ConnectionConfig {
     pub controller_url: String,
     pub client_id: String,
@@ -264,11 +268,26 @@ fn spawn_status_loop(
                     };
                     let ml = media_layer(wire);
                     let Some(actual) = engine.position_ms(ml) else { continue };
+                    // A clip with no seekable timeline (a still image via
+                    // imagefreeze) or whose duration isn't known yet can't be
+                    // meaningfully synced — don't touch it.
+                    let Some(duration) = engine.duration_ms(ml).filter(|d| *d > 0) else {
+                        continue;
+                    };
                     // Controller "now" through our filtered offset.
                     let controller_now = now_utc_ms() as i64 - offset;
                     let expected = controller_now - start as i64;
                     if expected < 0 {
                         continue; // cue hasn't nominally started yet
+                    }
+                    // The cue has been on air longer than its media is long:
+                    // the clip is holding its last frame (or about to EOS on its
+                    // own). `expected` now races past the media forever, so
+                    // "drift" reads as a huge, ever-growing negative and the old
+                    // code hard-seeked past the end every tick — visibly
+                    // resetting playback. There is nothing to correct here.
+                    if expected as u64 + SEEK_MARGIN_MS >= duration {
+                        continue;
                     }
                     let drift = actual as i64 - expected;
                     {
@@ -302,7 +321,10 @@ fn spawn_status_loop(
                                 }
                         }
                         Correction::HardSeek(_) => {
-                            let target = expected.max(0) as u64;
+                            // Never seek past the end (guarded above, but clamp
+                            // defensively so we always land on real media).
+                            let target = (expected.max(0) as u64)
+                                .min(duration.saturating_sub(SEEK_MARGIN_MS));
                             tracing::info!(?wire, drift, target, "hard seek to correct drift");
                             let _ = engine.seek_ms(ml, target);
                             let _ = engine.set_rate(ml, 1.0);
