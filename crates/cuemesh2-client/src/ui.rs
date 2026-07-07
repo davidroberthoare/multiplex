@@ -11,9 +11,6 @@ pub struct ClientApp {
     manual_url: String,
     engine: MediaEngine,
     video_texture: Option<egui::TextureHandle>,
-    /// Cached to avoid re-creating the ColorImage every frame when no new
-    /// frame has arrived.
-    have_new_frame: bool,
 }
 
 impl ClientApp {
@@ -24,29 +21,34 @@ impl ClientApp {
             manual_url,
             engine,
             video_texture: None,
-            have_new_frame: false,
         }
     }
 }
 
 impl eframe::App for ClientApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Repaint at ~60 fps so the video keeps flowing.
-        ctx.request_repaint_after(Duration::from_millis(16));
+        // Repaints are driven by the engine's frame-notify callback (see
+        // main.rs); this slow tick only keeps the overlay/status fresh when
+        // no video is flowing.
+        ctx.request_repaint_after(Duration::from_millis(250));
 
-        // ── Poll for a new composited video frame ────────────────────────
+        // ── Pick up a new composited video frame, if one landed ──────────
         if let Some(rgba) = self.engine.latest_frame() {
             let canvas = self.engine.canvas();
             let w = canvas.width as usize;
             let h = canvas.height as usize;
             if rgba.len() >= w * h * 4 {
                 let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
-                self.video_texture = Some(ctx.load_texture(
-                    "cuemesh2-video",
-                    color_image,
-                    egui::TextureOptions::default(),
-                ));
-                self.have_new_frame = true;
+                let opts = egui::TextureOptions::default();
+                // Update the existing texture in place; allocating a fresh
+                // GPU texture every frame causes visible jank.
+                match &mut self.video_texture {
+                    Some(tex) => tex.set(color_image, opts),
+                    None => {
+                        self.video_texture =
+                            Some(ctx.load_texture("cuemesh2-video", color_image, opts));
+                    }
+                }
             }
         }
 

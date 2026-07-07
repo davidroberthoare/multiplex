@@ -1,0 +1,17 @@
+[package]
+name = "playback-spike"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Throwaway A/B test bench for video playback smoothness. Not shipped."
+publish = false
+
+[dependencies]
+gstreamer = { workspace = true }
+gstreamer-app = { workspace = true }
+gstreamer-video = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+anyhow = { workspace = true }

@@ -77,7 +77,13 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "CueMesh2 Client",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(ui::ClientApp::new(ui_state, ui_engine)))),
+        Box::new(move |cc| {
+            // Repaint exactly when a composited frame lands, so presentation
+            // follows the pipeline clock instead of a polling timer.
+            let repaint_ctx = cc.egui_ctx.clone();
+            ui_engine.set_frame_notify(move || repaint_ctx.request_repaint());
+            Ok(Box::new(ui::ClientApp::new(ui_state, ui_engine)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))?;
     Ok(())
