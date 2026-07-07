@@ -18,8 +18,10 @@ pub enum ShowError {
     DuplicateCueId(String),
     #[error("cue {cue_id}: media file not found at {path}")]
     MediaMissing { cue_id: String, path: PathBuf },
-    #[error("cue {cue_id}: volume {volume} out of range 0..=100")]
-    VolumeOutOfRange { cue_id: String, volume: u8 },
+    #[error("cue {cue_id}: {problem}")]
+    InvalidCue { cue_id: String, problem: String },
+    #[error("failed to serialize show: {0}")]
+    Serialize(#[from] toml::ser::Error),
 }
 
 /// Top-level parsed show file.
@@ -113,8 +115,6 @@ pub struct Cue {
     #[serde(rename = "type")]
     pub kind: CueKind,
     pub file: PathBuf,
-    #[serde(default = "default_volume")]
-    pub volume: u8,
     #[serde(default)]
     pub fade_in_ms: u32,
     #[serde(default)]
@@ -125,10 +125,6 @@ pub struct Cue {
     pub crossfade_to_next_ms: u32,
     #[serde(default)]
     pub notes: Option<String>,
-}
-
-fn default_volume() -> u8 {
-    100
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,10 +144,34 @@ impl ShowFile {
     }
 
     /// Parse a show file from an in-memory string, then validate.
-    pub fn from_str(raw: &str) -> Result<Self, ShowError> {
+    /// (Also available through the standard `str::parse::<ShowFile>()`.)
+    pub fn parse_str(raw: &str) -> Result<Self, ShowError> {
         let show: ShowFile = toml::from_str(raw)?;
         show.validate()?;
         Ok(show)
+    }
+
+    /// A minimal empty show, the starting point for the editor's "New show".
+    pub fn new_empty(title: impl Into<String>) -> Self {
+        Self {
+            show: Show {
+                title: title.into(),
+                version: 1,
+                media_root: PathBuf::from("~/cuemesh_media"),
+                dropout_policy: DropoutPolicy::default(),
+                sync: SyncConfig::default(),
+                settings: ShowSettings::default(),
+            },
+            cues: Vec::new(),
+        }
+    }
+
+    /// Serialize to TOML and write to disk (used by the show editor).
+    pub fn save(&self, path: &Path) -> Result<(), ShowError> {
+        self.validate()?;
+        let toml = toml::to_string_pretty(self)?;
+        fs::write(path, toml)?;
+        Ok(())
     }
 
     /// Structural validation. Does *not* touch the filesystem — call
@@ -159,13 +179,28 @@ impl ShowFile {
     pub fn validate(&self) -> Result<(), ShowError> {
         let mut seen = std::collections::HashSet::new();
         for cue in &self.cues {
+            if cue.id.trim().is_empty() {
+                return Err(ShowError::InvalidCue {
+                    cue_id: cue.id.clone(),
+                    problem: "cue id must not be empty".into(),
+                });
+            }
             if !seen.insert(cue.id.as_str()) {
                 return Err(ShowError::DuplicateCueId(cue.id.clone()));
             }
-            if cue.volume > 100 {
-                return Err(ShowError::VolumeOutOfRange {
+            if cue.file.as_os_str().is_empty() {
+                return Err(ShowError::InvalidCue {
                     cue_id: cue.id.clone(),
-                    volume: cue.volume,
+                    problem: "file must not be empty".into(),
+                });
+            }
+            if cue.file.is_absolute() {
+                return Err(ShowError::InvalidCue {
+                    cue_id: cue.id.clone(),
+                    problem: format!(
+                        "file must be relative to media_root, got {}",
+                        cue.file.display()
+                    ),
                 });
             }
         }
@@ -184,6 +219,14 @@ impl ShowFile {
             }
         }
         Ok(())
+    }
+}
+
+impl std::str::FromStr for ShowFile {
+    type Err = ShowError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::parse_str(raw)
     }
 }
 
@@ -217,14 +260,53 @@ crossfade_to_next_ms = 500
 
     #[test]
     fn parses_example() {
-        let s = ShowFile::from_str(EXAMPLE).unwrap();
+        // Note: `volume` is a legacy key old show files may carry; it must
+        // be silently ignored, not rejected.
+        let s = ShowFile::parse_str(EXAMPLE).unwrap();
         assert_eq!(s.show.title, "T");
         assert_eq!(s.cues.len(), 2);
-        assert_eq!(s.cues[0].volume, 100);
-        assert_eq!(s.cues[1].volume, 80);
         assert_eq!(s.cues[1].crossfade_to_next_ms, 500);
         assert_eq!(s.show.dropout_policy, DropoutPolicy::Continue);
         assert_eq!(s.show.sync.max_drift_ms, 150);
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let mut sf = ShowFile::new_empty("Roundtrip");
+        sf.cues.push(Cue {
+            id: "c1".into(),
+            name: "First".into(),
+            kind: CueKind::Video,
+            file: PathBuf::from("a.mp4"),
+            fade_in_ms: 250,
+            fade_out_ms: 0,
+            crossfade_to_next_ms: 1000,
+            notes: Some("hello".into()),
+        });
+        let tmp = std::env::temp_dir().join("cuemesh2_show_roundtrip.cuemesh.toml");
+        sf.save(&tmp).unwrap();
+        let back = ShowFile::load(&tmp).unwrap();
+        assert_eq!(back.show.title, "Roundtrip");
+        assert_eq!(back.cues.len(), 1);
+        assert_eq!(back.cues[0].crossfade_to_next_ms, 1000);
+        assert_eq!(back.cues[0].notes.as_deref(), Some("hello"));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn rejects_absolute_cue_path() {
+        let mut sf = ShowFile::new_empty("T");
+        sf.cues.push(Cue {
+            id: "c1".into(),
+            name: "Bad".into(),
+            kind: CueKind::Video,
+            file: PathBuf::from("/etc/passwd"),
+            fade_in_ms: 0,
+            fade_out_ms: 0,
+            crossfade_to_next_ms: 0,
+            notes: None,
+        });
+        assert!(matches!(sf.validate(), Err(ShowError::InvalidCue { .. })));
     }
 
     #[test]
@@ -247,12 +329,12 @@ name = "A2"
 type = "video"
 file = "b.mp4"
 "#;
-        let err = ShowFile::from_str(dup).unwrap_err();
+        let err = ShowFile::parse_str(dup).unwrap_err();
         assert!(matches!(err, ShowError::DuplicateCueId(_)));
     }
 
     #[test]
-    fn rejects_out_of_range_volume() {
+    fn rejects_empty_cue_id() {
         let bad = r#"
 [show]
 title = "T"
@@ -260,13 +342,12 @@ version = 1
 media_root = "/tmp"
 
 [[cues]]
-id = "a"
+id = ""
 name = "A"
 type = "video"
 file = "a.mp4"
-volume = 200
 "#;
-        let err = ShowFile::from_str(bad).unwrap_err();
-        assert!(matches!(err, ShowError::VolumeOutOfRange { .. }));
+        let err = ShowFile::parse_str(bad).unwrap_err();
+        assert!(matches!(err, ShowError::InvalidCue { .. }));
     }
 }

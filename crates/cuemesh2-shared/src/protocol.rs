@@ -14,6 +14,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::show::{Cue, CueKind, DropoutPolicy, SyncConfig};
+
 /// Envelope wrapping any protocol message with the sender's UTC timestamp.
 ///
 /// Serializes flat: `{"ts_utc_ms": ..., "type": ..., "payload": ...}`.
@@ -31,7 +33,7 @@ impl<M> Envelope<M> {
 }
 
 /// One of the two video layers the client compositor exposes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Layer {
     A,
@@ -58,14 +60,17 @@ pub enum ClientState {
 #[serde(tag = "type", content = "payload", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ControllerMsg {
     HelloAck(HelloAck),
+    /// Push the parts of the show file clients need (dropout policy, sync
+    /// params, cue list). Sent on show load and to every client that joins.
+    ShowSync(ShowSync),
     LoadCue(LoadCue),
     PlayAt(PlayAt),
     SeekTo(SeekTo),
     SetRate(SetRate),
-    SetVolume(SetVolume),
-    Crossfade(Crossfade),
     /// Freeze all layers in place (no fades).
     Pause,
+    /// Resume whatever was frozen by PAUSE.
+    Resume,
     /// Fade all layers to black over the given duration, then stop.
     /// The controller reads its show's `default_fade_ms` and fills this in;
     /// clients don't need the show file to honour the command.
@@ -73,9 +78,16 @@ pub enum ControllerMsg {
     /// Cut all layers to black immediately, stop pipelines.
     Stop,
     ShowTestscreen,
+    HideTestscreen,
     RequestStatus,
     Sync(SyncPing),
     ReadyCheck,
+    /// Ask the client to hash these files under its media root and report.
+    MediaCheck(MediaCheck),
+    /// Announce an incoming file transfer; binary chunks follow.
+    MediaPushBegin(MediaPushBegin),
+    /// All chunks for this transfer have been sent.
+    MediaPushEnd(MediaPushEnd),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,17 +96,31 @@ pub struct HelloAck {
     pub protocol_version: u32,
 }
 
+/// The subset of the show file every client needs to run cues.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShowSync {
+    pub title: String,
+    pub dropout_policy: DropoutPolicy,
+    pub sync: SyncConfig,
+    pub default_fade_ms: u32,
+    pub cues: Vec<Cue>,
+}
+
 /// Preroll a cue onto a specific layer without playing it.
+///
+/// `file` is **relative to the media root**; each side resolves it against
+/// its own root (controller: the show's `media_root`; client: its configured
+/// `CUEMESH_MEDIA_ROOT`). Absolute paths would only work single-box.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadCue {
     pub cue_id: String,
     pub layer: Layer,
     pub file: PathBuf,
+    pub kind: CueKind,
     #[serde(default)]
     pub start_ms: Option<u64>,
     #[serde(default)]
     pub end_ms: Option<u64>,
-    pub volume: u8,
     pub fade_in_ms: u32,
     pub fade_out_ms: u32,
     #[serde(default)]
@@ -106,6 +132,14 @@ pub struct LoadCue {
 pub struct PlayAt {
     pub layer: Layer,
     pub master_start_utc_ms: u64,
+    /// Ramp this layer's alpha 0→1 over this many ms at start (0 = cut).
+    #[serde(default)]
+    pub fade_in_ms: u32,
+    /// If set, simultaneously ramp the *other* layer to 0 over the same
+    /// number of ms and stop it when the ramp lands — i.e. a crossfade.
+    /// Overrides `fade_in_ms` for the incoming layer.
+    #[serde(default)]
+    pub crossfade_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,21 +155,36 @@ pub struct SetRate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetVolume {
-    pub layer: Layer,
-    pub volume: u8,
-}
-
-/// Operator-triggered manual crossfade to a specific cue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Crossfade {
-    pub to_cue_id: String,
-    pub duration_ms: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FadeCmd {
     pub duration_ms: u32,
+}
+
+/// One file the controller expects the client to have.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaFileSpec {
+    /// Path relative to the media root.
+    pub rel_path: PathBuf,
+    pub size: u64,
+    pub sha256_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaCheck {
+    pub files: Vec<MediaFileSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaPushBegin {
+    /// Correlates the binary chunks and the END/RESULT messages.
+    pub transfer_id: u64,
+    pub rel_path: PathBuf,
+    pub size: u64,
+    pub sha256_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaPushEnd {
+    pub transfer_id: u64,
 }
 
 /// Controller-driven NTP-style sync ping.
@@ -145,6 +194,13 @@ pub struct SyncPing {
     pub t1_utc_ms: u64,
     /// Opaque token echoed back in the reply.
     pub token: u64,
+    /// The controller's most recent RTT-corrected measurement of this
+    /// client's clock offset (client_local − controller_utc, ms). The client
+    /// medians these and uses the result to convert `master_start_utc_ms`
+    /// into local time and to measure playback drift. `None` until the first
+    /// SYNC_REPLY has been processed.
+    #[serde(default)]
+    pub last_offset_ms: Option<i64>,
 }
 
 // ─── Client → Controller ──────────────────────────────────────────────────
@@ -160,6 +216,12 @@ pub enum ClientMsg {
     Heartbeat,
     Log(LogEntry),
     SyncReply(SyncReply),
+    /// Reply to MEDIA_CHECK: per-file verification results.
+    MediaReport(MediaReport),
+    /// Periodic progress while receiving a MEDIA_PUSH (for the operator UI).
+    MediaPushProgress(MediaPushProgress),
+    /// Final verdict on a MEDIA_PUSH after hash verification.
+    MediaPushResult(MediaPushResult),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,9 +243,48 @@ pub struct Status {
     pub current_cue_id: Option<String>,
     pub position_ms: u64,
     pub rate: f32,
-    pub volume: u8,
     pub layer_a_alpha: f32,
     pub layer_b_alpha: f32,
+}
+
+/// How one expected file looks on the client's disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum MediaFileStatus {
+    /// Present with matching size and hash.
+    Ok,
+    /// Not present at all.
+    Missing,
+    /// Present but different content.
+    Mismatch { size: u64, sha256_hex: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaReportEntry {
+    pub rel_path: PathBuf,
+    #[serde(flatten)]
+    pub status: MediaFileStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaReport {
+    pub entries: Vec<MediaReportEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaPushProgress {
+    pub transfer_id: u64,
+    pub received_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaPushResult {
+    pub transfer_id: u64,
+    pub rel_path: PathBuf,
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,7 +320,7 @@ pub struct SyncReply {
 }
 
 /// Current protocol version. Bump when wire format changes in a breaking way.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// TCP port the controller listens on.
 pub const DEFAULT_PORT: u16 = 9420;
@@ -261,9 +362,9 @@ mod tests {
                 cue_id: "cue-1".into(),
                 layer: Layer::A,
                 file: PathBuf::from("intro.mp4"),
+                kind: CueKind::Video,
                 start_ms: None,
                 end_ms: Some(30_000),
-                volume: 90,
                 fade_in_ms: 500,
                 fade_out_ms: 0,
                 crossfade_to_next_ms: 1000,
@@ -275,8 +376,162 @@ mod tests {
             ControllerMsg::LoadCue(c) => {
                 assert_eq!(c.cue_id, "cue-1");
                 assert_eq!(c.layer, Layer::A);
-                assert_eq!(c.volume, 90);
+                assert_eq!(c.kind, CueKind::Video);
                 assert_eq!(c.crossfade_to_next_ms, 1000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn play_at_crossfade_roundtrip() {
+        let env = Envelope::new(
+            5,
+            ControllerMsg::PlayAt(PlayAt {
+                layer: Layer::B,
+                master_start_utc_ms: 123,
+                fade_in_ms: 0,
+                crossfade_ms: Some(1500),
+            }),
+        );
+        let json = serde_json::to_string(&env).unwrap();
+        let back: Envelope<ControllerMsg> = serde_json::from_str(&json).unwrap();
+        match back.msg {
+            ControllerMsg::PlayAt(p) => {
+                assert_eq!(p.layer, Layer::B);
+                assert_eq!(p.crossfade_ms, Some(1500));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn play_at_defaults_are_backwards_lenient() {
+        // A minimal PLAY_AT without the new fields must still parse.
+        let json = r#"{"ts_utc_ms":1,"type":"PLAY_AT","payload":{"layer":"A","master_start_utc_ms":42}}"#;
+        let back: Envelope<ControllerMsg> = serde_json::from_str(json).unwrap();
+        match back.msg {
+            ControllerMsg::PlayAt(p) => {
+                assert_eq!(p.fade_in_ms, 0);
+                assert_eq!(p.crossfade_ms, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn show_sync_roundtrip() {
+        let env = Envelope::new(
+            9,
+            ControllerMsg::ShowSync(ShowSync {
+                title: "T".into(),
+                dropout_policy: DropoutPolicy::Freeze,
+                sync: SyncConfig::default(),
+                default_fade_ms: 1500,
+                cues: vec![Cue {
+                    id: "c1".into(),
+                    name: "One".into(),
+                    kind: CueKind::Image,
+                    file: PathBuf::from("a.jpg"),
+                    fade_in_ms: 0,
+                    fade_out_ms: 0,
+                    crossfade_to_next_ms: 0,
+                    notes: None,
+                }],
+            }),
+        );
+        let json = serde_json::to_string(&env).unwrap();
+        let back: Envelope<ControllerMsg> = serde_json::from_str(&json).unwrap();
+        match back.msg {
+            ControllerMsg::ShowSync(s) => {
+                assert_eq!(s.title, "T");
+                assert_eq!(s.dropout_policy, DropoutPolicy::Freeze);
+                assert_eq!(s.cues.len(), 1);
+                assert_eq!(s.cues[0].kind, CueKind::Image);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn media_check_and_report_roundtrip() {
+        let check = Envelope::new(
+            1,
+            ControllerMsg::MediaCheck(MediaCheck {
+                files: vec![MediaFileSpec {
+                    rel_path: PathBuf::from("a.mp4"),
+                    size: 100,
+                    sha256_hex: "ab".into(),
+                }],
+            }),
+        );
+        let json = serde_json::to_string(&check).unwrap();
+        let back: Envelope<ControllerMsg> = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.msg, ControllerMsg::MediaCheck(_)));
+
+        let report = Envelope::new(
+            2,
+            ClientMsg::MediaReport(MediaReport {
+                entries: vec![
+                    MediaReportEntry {
+                        rel_path: PathBuf::from("a.mp4"),
+                        status: MediaFileStatus::Ok,
+                    },
+                    MediaReportEntry {
+                        rel_path: PathBuf::from("b.mp4"),
+                        status: MediaFileStatus::Mismatch {
+                            size: 5,
+                            sha256_hex: "cd".into(),
+                        },
+                    },
+                ],
+            }),
+        );
+        let json = serde_json::to_string(&report).unwrap();
+        let back: Envelope<ClientMsg> = serde_json::from_str(&json).unwrap();
+        match back.msg {
+            ClientMsg::MediaReport(r) => {
+                assert_eq!(r.entries.len(), 2);
+                assert_eq!(r.entries[0].status, MediaFileStatus::Ok);
+                assert!(matches!(r.entries[1].status, MediaFileStatus::Mismatch { .. }));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn media_push_messages_roundtrip() {
+        let begin = Envelope::new(
+            1,
+            ControllerMsg::MediaPushBegin(MediaPushBegin {
+                transfer_id: 77,
+                rel_path: PathBuf::from("clip.mp4"),
+                size: 1024,
+                sha256_hex: "ff".into(),
+            }),
+        );
+        let json = serde_json::to_string(&begin).unwrap();
+        let back: Envelope<ControllerMsg> = serde_json::from_str(&json).unwrap();
+        match back.msg {
+            ControllerMsg::MediaPushBegin(b) => assert_eq!(b.transfer_id, 77),
+            _ => panic!("wrong variant"),
+        }
+
+        let result = Envelope::new(
+            2,
+            ClientMsg::MediaPushResult(MediaPushResult {
+                transfer_id: 77,
+                rel_path: PathBuf::from("clip.mp4"),
+                ok: false,
+                error: Some("hash mismatch".into()),
+            }),
+        );
+        let json = serde_json::to_string(&result).unwrap();
+        let back: Envelope<ClientMsg> = serde_json::from_str(&json).unwrap();
+        match back.msg {
+            ClientMsg::MediaPushResult(r) => {
+                assert!(!r.ok);
+                assert_eq!(r.error.as_deref(), Some("hash mismatch"));
             }
             _ => panic!("wrong variant"),
         }

@@ -7,13 +7,12 @@
 //! Env vars:
 //!   `CUEMESH_CONTROLLER` — controller URL (default `ws://127.0.0.1:9420`)
 //!   `CUEMESH_NAME`       — human-readable client name (default hostname)
+//!   `CUEMESH_MEDIA_ROOT` — where this client's media lives
+//!                          (default `~/cuemesh_media`)
 //!
 //! See `CLAUDE.md` at the workspace root for the design brief.
 
-mod connection;
-mod state;
-mod ui;
-
+use cuemesh2_client::{connection, discovery, state, ui};
 use cuemesh2_media::MediaEngine;
 
 fn main() -> anyhow::Result<()> {
@@ -31,6 +30,13 @@ fn main() -> anyhow::Result<()> {
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "cuemesh-client".into());
     let client_id = uuid::Uuid::new_v4().to_string();
+    let media_root = std::env::var("CUEMESH_MEDIA_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("cuemesh_media")
+        });
 
     let engine = MediaEngine::new()?;
     let state = state::shared();
@@ -39,11 +45,14 @@ fn main() -> anyhow::Result<()> {
         s.client_id = client_id.clone();
         s.name = name.clone();
         s.controller_addr = controller_url.clone();
+        s.media_root = media_root.clone();
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+
+    discovery::spawn_browser(state.clone());
 
     let conn_state = state.clone();
     let conn_engine = engine.clone();
@@ -53,6 +62,7 @@ fn main() -> anyhow::Result<()> {
                 controller_url,
                 client_id,
                 name,
+                media_root,
             },
             conn_state,
             conn_engine,

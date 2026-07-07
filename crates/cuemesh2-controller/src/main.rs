@@ -5,13 +5,9 @@
 //!
 //! See `CLAUDE.md` at the workspace root for the design brief.
 
-mod server;
-mod state;
-mod sync;
-mod ui;
-
 use std::net::SocketAddr;
 
+use cuemesh2_controller::{discovery, server, state, sync, ui};
 use cuemesh2_shared::protocol::DEFAULT_PORT;
 
 fn main() -> anyhow::Result<()> {
@@ -39,6 +35,7 @@ fn main() -> anyhow::Result<()> {
             tracing::error!("server exited: {e}");
         }
     });
+    discovery::advertise(bind.port());
     let sync_state = state.clone();
     rt.spawn(async move {
         sync::run(sync_state).await;

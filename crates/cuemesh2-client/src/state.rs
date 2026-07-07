@@ -1,8 +1,9 @@
 //! Client-side state shared between the network task and the egui window.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use cuemesh2_shared::protocol::ClientState;
+use cuemesh2_shared::protocol::{ClientState, ShowSync};
 
 #[derive(Debug, Default)]
 pub struct AppState {
@@ -10,6 +11,22 @@ pub struct AppState {
     pub name: String,
     pub controller_addr: String,
     pub connected: bool,
+    pub media_root: PathBuf,
+    /// Controllers found via mDNS: instance fullname → ws URL.
+    pub discovered: std::collections::HashMap<String, String>,
+    /// URL the user picked in the UI; the reconnect loop switches to it on
+    /// its next attempt (it does not sever a live connection).
+    pub desired_url: Option<String>,
+    /// Show metadata pushed by the controller (dropout policy, sync params,
+    /// cue list). None until the first SHOW_SYNC arrives.
+    pub show: Option<ShowSync>,
+    /// Median-filtered clock offset (client_local − controller_utc, ms),
+    /// as measured by the controller and echoed in SYNC pings.
+    pub clock_offset_ms: Option<i64>,
+    /// Rolling median over recent controller-measured offsets.
+    pub offset_filter: Option<cuemesh2_shared::clock_sync::OffsetFilter>,
+    /// Last playback drift measurement (positive = ahead of master).
+    pub last_drift_ms: Option<i64>,
     pub playback: ClientPlayback,
     pub log_lines: Vec<String>,
 }
@@ -19,8 +36,19 @@ pub struct ClientPlayback {
     pub state: PlaybackState,
     pub current_cue_id: Option<String>,
     pub position_ms: u64,
+    pub layer_a: LayerInfo,
+    pub layer_b: LayerInfo,
     pub layer_a_alpha: f32,
     pub layer_b_alpha: f32,
+}
+
+/// What the client believes is on one of its two layers.
+#[derive(Debug, Clone, Default)]
+pub struct LayerInfo {
+    pub cue_id: Option<String>,
+    /// Wall-clock start (controller UTC ms) of the running cue, for drift.
+    pub master_start_utc_ms: Option<u64>,
+    pub playing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -50,6 +78,13 @@ impl From<PlaybackState> for ClientState {
 }
 
 impl AppState {
+    pub fn layer_mut(&mut self, layer: cuemesh2_shared::protocol::Layer) -> &mut LayerInfo {
+        match layer {
+            cuemesh2_shared::protocol::Layer::A => &mut self.playback.layer_a,
+            cuemesh2_shared::protocol::Layer::B => &mut self.playback.layer_b,
+        }
+    }
+
     pub fn push_log(&mut self, line: impl Into<String>) {
         const CAP: usize = 200;
         self.log_lines.push(line.into());

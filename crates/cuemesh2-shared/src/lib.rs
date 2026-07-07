@@ -7,3 +7,4 @@ pub mod hashing;
 pub mod logging;
 pub mod protocol;
 pub mod show;
+pub mod transfer;

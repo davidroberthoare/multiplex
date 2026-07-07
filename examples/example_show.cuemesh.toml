@@ -1,3 +1,12 @@
+# CueMesh2 example show.
+#
+# Media paths are relative to media_root; every client resolves them
+# against its OWN media root (env CUEMESH_MEDIA_ROOT, default the same
+# ~/cuemesh_media), so this file works unchanged across machines.
+#
+# Recommended encoding: H.264 in MP4. Hardware decoding picks it up on
+# virtually everything; AV1/HEVC fall back to slow software decoding.
+
 [show]
 title = "Example Show"
 version = 1
@@ -15,32 +24,34 @@ hard_seek_threshold_ms = 300
 sync_interval_ms = 1000
 
 [show.settings]
-default_fade_ms = 1500               # used by the operator FADE command
+default_fade_ms = 1500               # used by the operator BLACKOUT command
 
 [[cues]]
 id = "cue-001"
-name = "Opening Title"
+name = "Preshow Title"
 type = "image"
 file = "pic1.jpg"
-volume = 100
 fade_in_ms = 500
 fade_out_ms = 500
 
 [[cues]]
 id = "cue-002"
-name = "Intro Video"
+name = "Countdown"
 type = "video"
 file = "countdown.mp4"
-volume = 85
 fade_in_ms = 750
-fade_out_ms = 0
-crossfade_to_next_ms = 1000          # crossfade into cue-003
+crossfade_to_next_ms = 1000          # GO during this cue crossfades into the next
 
 [[cues]]
 id = "cue-003"
-name = "Main Loop"
+name = "Main Video"
 type = "video"
 file = "test1.mp4"
-volume = 90
-fade_in_ms = 0
 fade_out_ms = 1500
+
+[[cues]]
+id = "cue-004"
+name = "Closing Card"
+type = "image"
+file = "pic2.jpg"
+fade_in_ms = 1000
