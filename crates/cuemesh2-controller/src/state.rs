@@ -46,6 +46,14 @@ pub struct RunState {
     pub playing_cue_idx: Option<usize>,
     /// Layer that cue went out on; the next GO uses the other layer.
     pub active_layer: Option<Layer>,
+    /// (cue_id, layer) currently pre-loaded on clients via STANDBY, so GO can
+    /// skip the LOAD_CUE and fire PLAY_AT alone. Cleared when consumed by GO
+    /// or invalidated by a show change.
+    pub standby: Option<(String, Layer)>,
+    /// The next STANDBY target layer is busy finishing a crossfade-out until
+    /// this controller-UTC ms; preloading onto it before then would cut the
+    /// outgoing video. 0 = free now.
+    pub idle_free_utc_ms: u64,
 }
 
 #[derive(Debug, Default)]

@@ -10,8 +10,10 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 use cuemesh2_shared::protocol::{
-    ClientMsg, ClientState, ControllerMsg, Envelope, HelloAck, ShowSync, PROTOCOL_VERSION,
+    ClientMsg, ClientState, ControllerMsg, Envelope, HelloAck, Layer, LoadCue, ShowSync,
+    PROTOCOL_VERSION,
 };
+use cuemesh2_shared::show::Cue;
 
 use crate::state::{ClientRow, Outgoing, SharedState};
 
@@ -55,6 +57,30 @@ pub fn show_sync_msg(state: &SharedState) -> Option<ControllerMsg> {
         default_fade_ms: show.show.settings.default_fade_ms,
         cues: show.cues.clone(),
     }))
+}
+
+/// A LOAD_CUE/STANDBY payload preloading `cue` onto `layer`.
+pub fn load_cue_for(cue: &Cue, layer: Layer) -> LoadCue {
+    LoadCue {
+        cue_id: cue.id.clone(),
+        layer,
+        file: cue.file.clone(),
+        kind: cue.kind,
+        start_ms: None,
+        end_ms: None,
+        fade_in_ms: cue.fade_in_ms,
+        fade_out_ms: cue.fade_out_ms,
+        crossfade_to_next_ms: cue.crossfade_to_next_ms,
+    }
+}
+
+/// Build a STANDBY for whatever cue is currently on standby, so a client that
+/// joins after the controller already issued the standby still prerolls it.
+pub fn standby_msg(state: &SharedState) -> Option<ControllerMsg> {
+    let s = state.lock().unwrap();
+    let (cue_id, layer) = s.run.standby.as_ref()?;
+    let cue = s.show.as_ref()?.cues.iter().find(|c| &c.id == cue_id)?;
+    Some(ControllerMsg::Standby(load_cue_for(cue, *layer)))
 }
 
 async fn handle_conn(stream: TcpStream, addr: SocketAddr, state: SharedState) -> Result<()> {
@@ -128,6 +154,12 @@ async fn handle_conn(stream: TcpStream, addr: SocketAddr, state: SharedState) ->
     );
     sink.send(WsMsg::Text(serde_json::to_string(&ack)?)).await?;
     if let Some(msg) = show_sync_msg(&state) {
+        let _ = out_tx.try_send(Outgoing::Msg(msg));
+    }
+    // Catch a joining client up on the current standby so its GO is instant
+    // too — the controller may have issued the standby before this client
+    // (or any client) was connected.
+    if let Some(msg) = standby_msg(&state) {
         let _ = out_tx.try_send(Outgoing::Msg(msg));
     }
 

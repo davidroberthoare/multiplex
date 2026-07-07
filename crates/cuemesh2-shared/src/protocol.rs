@@ -64,6 +64,13 @@ pub enum ControllerMsg {
     /// params, cue list). Sent on show load and to every client that joins.
     ShowSync(ShowSync),
     LoadCue(LoadCue),
+    /// Preload a cue onto the layer it will next play on, ahead of GO, so the
+    /// following PLAY_AT starts instantly instead of stalling on a cold
+    /// decode. Same payload and client behaviour as LOAD_CUE — the distinct
+    /// variant lets the operator UI drive speculative preloads when a cue is
+    /// selected (or auto-advanced) without conflating them with an explicit,
+    /// operator-forced load.
+    Standby(LoadCue),
     PlayAt(PlayAt),
     SeekTo(SeekTo),
     SetRate(SetRate),
@@ -378,6 +385,34 @@ mod tests {
                 assert_eq!(c.layer, Layer::A);
                 assert_eq!(c.kind, CueKind::Video);
                 assert_eq!(c.crossfade_to_next_ms, 1000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn standby_roundtrip() {
+        let env = Envelope::new(
+            7,
+            ControllerMsg::Standby(LoadCue {
+                cue_id: "cue-9".into(),
+                layer: Layer::B,
+                file: PathBuf::from("next.mp4"),
+                kind: CueKind::Video,
+                start_ms: None,
+                end_ms: None,
+                fade_in_ms: 500,
+                fade_out_ms: 0,
+                crossfade_to_next_ms: 0,
+            }),
+        );
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains(r#""type":"STANDBY""#));
+        let back: Envelope<ControllerMsg> = serde_json::from_str(&json).unwrap();
+        match back.msg {
+            ControllerMsg::Standby(c) => {
+                assert_eq!(c.cue_id, "cue-9");
+                assert_eq!(c.layer, Layer::B);
             }
             _ => panic!("wrong variant"),
         }

@@ -7,19 +7,19 @@
 //! cargo run -p playback-spike --release -- crossfade <fileA> <fileB>
 //! ```
 //!
-//! * `playbin`   — stock playbin + a real video sink in its own window.
-//!                 Ground truth: what GStreamer can do on this box (≈ VLC).
-//! * `current`   — faithful replica of the shipped engine path: conform to a
-//!                 1080p30 I420 canvas (videoscale+videorate), intervideo
-//!                 channel, compositor, appsink sync=false, egui polling at
-//!                 16ms and re-creating the texture every frame.
-//! * `fixed`     — appsink path with the suspected problems removed: native
-//!                 resolution and framerate (no videorate), sync=true so the
-//!                 pipeline clock paces frames, repaint driven by frame
-//!                 arrival, texture updated in place.
-//! * `crossfade` — like `fixed` but two decoders into a compositor with an
-//!                 automatic alpha ramp every few seconds, to check that the
-//!                 two-layer crossfade architecture survives the fixes.
+//! - `playbin` — stock playbin + a real video sink in its own window.
+//!   Ground truth: what GStreamer can do on this box (≈ VLC).
+//! - `current` — faithful replica of the shipped engine path: conform to a
+//!   1080p30 I420 canvas (videoscale+videorate), intervideo channel,
+//!   compositor, appsink sync=false, egui polling at 16ms and re-creating
+//!   the texture every frame.
+//! - `fixed` — appsink path with the suspected problems removed: native
+//!   resolution and framerate (no videorate), sync=true so the pipeline
+//!   clock paces frames, repaint driven by frame arrival, texture updated
+//!   in place.
+//! - `crossfade` — like `fixed` but two decoders into a compositor with an
+//!   automatic alpha ramp every few seconds, to check that the two-layer
+//!   crossfade architecture survives the fixes.
 //!
 //! Every mode prints frame-interval stats every 3 s:
 //! arrivals = frames delivered by GStreamer, paints = egui repaints.

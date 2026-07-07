@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use cuemesh2_media::{fades, MediaEngine, MediaEvent, MediaKind};
 use cuemesh2_shared::clock_sync::{correction_for, Correction, CorrectionParams, OffsetFilter};
 use cuemesh2_shared::protocol::{
-    ClientMsg, ControllerMsg, Envelope, Hello, Layer as WireLayer, MediaFileStatus,
+    ClientMsg, ControllerMsg, Envelope, Hello, Layer as WireLayer, LoadCue, MediaFileStatus,
     MediaPushProgress, MediaPushResult, MediaReport, MediaReportEntry, Ready, Status, SyncReply,
     PROTOCOL_VERSION,
 };
@@ -448,6 +448,51 @@ fn spawn_status_loop(
     })
 }
 
+/// Preroll a cue onto its layer without playing it (shared by LOAD_CUE and
+/// STANDBY — the two are behaviourally identical; only the intent and the log
+/// line differ). Leaves the layer at alpha 0 and reports READY so the
+/// controller knows a subsequent PLAY_AT will start instantly.
+fn preload_cue(
+    c: LoadCue,
+    why: &str,
+    cfg: &Arc<ConnectionConfig>,
+    state: &SharedState,
+    engine: &MediaEngine,
+    outbound: &mpsc::Sender<ClientMsg>,
+) {
+    let ml = media_layer(c.layer);
+    let full = cfg.media_root.join(&c.file);
+    log(
+        state,
+        format!("{why} {} → layer {:?}  file={}", c.cue_id, c.layer, full.display()),
+    );
+    let kind = match c.kind {
+        CueKind::Video => MediaKind::Video,
+        CueKind::Image => MediaKind::Image,
+    };
+    engine.set_alpha(ml, 0.0);
+    match engine.load(ml, &full, kind) {
+        Ok(_) => {
+            {
+                let mut s = state.lock().unwrap();
+                let info = s.layer_mut(c.layer);
+                info.cue_id = Some(c.cue_id.clone());
+                info.master_start_utc_ms = None;
+                info.playing = false;
+                s.playback.state = PlaybackState::Ready;
+            }
+            let _ = outbound.try_send(ClientMsg::Ready(Ready {
+                cue_id: c.cue_id,
+                layer: c.layer,
+            }));
+        }
+        Err(e) => {
+            log(state, format!("{why} load failed: {e}"));
+            state.lock().unwrap().playback.state = PlaybackState::Error;
+        }
+    }
+}
+
 async fn handle_controller_msg(
     env: Envelope<ControllerMsg>,
     cfg: &Arc<ConnectionConfig>,
@@ -467,39 +512,8 @@ async fn handle_controller_msg(
             );
             state.lock().unwrap().show = Some(show);
         }
-        ControllerMsg::LoadCue(c) => {
-            let ml = media_layer(c.layer);
-            let full = cfg.media_root.join(&c.file);
-            log(
-                state,
-                format!("LOAD_CUE {} → layer {:?}  file={}", c.cue_id, c.layer, full.display()),
-            );
-            let kind = match c.kind {
-                CueKind::Video => MediaKind::Video,
-                CueKind::Image => MediaKind::Image,
-            };
-            engine.set_alpha(ml, 0.0);
-            match engine.load(ml, &full, kind) {
-                Ok(_) => {
-                    {
-                        let mut s = state.lock().unwrap();
-                        let info = s.layer_mut(c.layer);
-                        info.cue_id = Some(c.cue_id.clone());
-                        info.master_start_utc_ms = None;
-                        info.playing = false;
-                        s.playback.state = PlaybackState::Ready;
-                    }
-                    let _ = outbound.try_send(ClientMsg::Ready(Ready {
-                        cue_id: c.cue_id,
-                        layer: c.layer,
-                    }));
-                }
-                Err(e) => {
-                    log(state, format!("load failed: {e}"));
-                    state.lock().unwrap().playback.state = PlaybackState::Error;
-                }
-            }
-        }
+        ControllerMsg::LoadCue(c) => preload_cue(c, "LOAD_CUE", cfg, state, engine, outbound),
+        ControllerMsg::Standby(c) => preload_cue(c, "STANDBY", cfg, state, engine, outbound),
         ControllerMsg::PlayAt(p) => {
             let ml = media_layer(p.layer);
             // Convert master (controller-UTC) start into local time using the

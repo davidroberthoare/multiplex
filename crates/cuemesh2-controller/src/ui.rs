@@ -2,22 +2,38 @@
 //! with preflight results and media push, log view.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use cuemesh2_shared::protocol::{
-    ControllerMsg, FadeCmd, Layer, LoadCue, MediaFileStatus, PlayAt,
-};
+use cuemesh2_shared::protocol::{ControllerMsg, FadeCmd, Layer, MediaFileStatus, PlayAt};
 use cuemesh2_shared::show::ShowFile;
 
 use crate::editor::{EditorAction, EditorState};
 use crate::preflight;
-use crate::server::{broadcast, now_utc_ms};
+use crate::server::{broadcast, load_cue_for, now_utc_ms};
 use crate::state::SharedState;
+
+/// How long a cue selection must hold still before we preload it. Keeps
+/// arrow-key scrolling from firing a cold decode on every intermediate cue.
+const SELECTION_SETTLE_MS: u128 = 150;
+
+/// The layer the next GO (and thus the next STANDBY) will target: the opposite
+/// of whatever is currently on air, or A when nothing is playing.
+fn idle_layer(active: Option<Layer>) -> Layer {
+    match active {
+        Some(Layer::A) => Layer::B,
+        Some(Layer::B) => Layer::A,
+        None => Layer::A,
+    }
+}
 
 pub struct ControllerApp {
     state: SharedState,
     testscreen_on: bool,
     editor: EditorState,
+    /// Last selection we observed, and when it last changed — drives the
+    /// standby debounce.
+    last_selected: Option<usize>,
+    selected_since: Instant,
 }
 
 impl ControllerApp {
@@ -26,6 +42,8 @@ impl ControllerApp {
             state,
             testscreen_on: false,
             editor: EditorState::default(),
+            last_selected: None,
+            selected_since: Instant::now(),
         };
         // Auto-load the show named by CUEMESH_SHOW so headless-ish setups
         // (and operators with a fixed show) skip the open dialog entirely.
@@ -58,8 +76,11 @@ impl ControllerApp {
         }
     }
 
-    /// Fire the selected cue: load it on the idle layer, start it with lead
-    /// time, crossfading from whatever is on air. Advances the selection.
+    /// Fire the selected cue: start it with lead time, crossfading from
+    /// whatever is on air. If the cue was already pre-loaded on the target
+    /// layer via STANDBY, this is just a PLAY_AT and starts instantly;
+    /// otherwise it falls back to loading now (a cold decode that will stall).
+    /// Advances the selection.
     fn go_selected(&self) {
         let plan = {
             let mut s = self.state.lock().unwrap();
@@ -70,11 +91,7 @@ impl ControllerApp {
             let outgoing = s.run.playing_cue_idx.and_then(|i| show.cues.get(i).cloned());
             let n = show.cues.len();
             let lead_ms = show.show.sync.start_lead_ms.max(250) as u64;
-            let target_layer = match s.run.active_layer {
-                Some(Layer::A) => Layer::B,
-                Some(Layer::B) => Layer::A,
-                None => Layer::A,
-            };
+            let target_layer = idle_layer(s.run.active_layer);
             // Crossfade when something is on air. The duration prefers the
             // outgoing cue's crossfade_to_next_ms, falls back to the incoming
             // fade-in, and never goes below 40ms (a near-cut, but glitch-free).
@@ -82,28 +99,37 @@ impl ControllerApp {
                 .as_ref()
                 .map(|out| out.crossfade_to_next_ms.max(cue.fade_in_ms).max(40));
 
+            // Did STANDBY already preload this exact cue on this layer?
+            let preloaded = s.run.standby.as_ref() == Some(&(cue.id.clone(), target_layer));
+
             s.run.playing_cue_idx = Some(idx);
             s.run.active_layer = Some(target_layer);
+            // Standby is consumed (or invalidated by an out-of-order GO).
+            s.run.standby = None;
+            // The layer the *next* GO targets is the one we're now fading
+            // away from; hold the next STANDBY off it until the crossfade has
+            // finished (loading resets a layer's alpha to 0, which would cut
+            // the outgoing video). A cut (no crossfade) frees it immediately.
+            s.run.idle_free_utc_ms = match crossfade_ms {
+                Some(ms) => now_utc_ms() + lead_ms + ms as u64 + 300,
+                None => 0,
+            };
             s.selected_cue_idx = Some((idx + 1).min(n.saturating_sub(1)));
-            s.push_log(format!("GO cue {} on layer {:?}", cue.id, target_layer));
-            (cue, target_layer, crossfade_ms, lead_ms)
+            s.push_log(format!(
+                "GO cue {} on layer {target_layer:?}{}",
+                cue.id,
+                if preloaded { " (preloaded)" } else { " (cold load)" }
+            ));
+            (cue, target_layer, crossfade_ms, lead_ms, preloaded)
         };
-        let (cue, layer, crossfade_ms, lead_ms) = plan;
+        let (cue, layer, crossfade_ms, lead_ms, preloaded) = plan;
 
-        broadcast(
-            &self.state,
-            ControllerMsg::LoadCue(LoadCue {
-                cue_id: cue.id.clone(),
-                layer,
-                file: cue.file.clone(),
-                kind: cue.kind,
-                start_ms: None,
-                end_ms: None,
-                fade_in_ms: cue.fade_in_ms,
-                fade_out_ms: cue.fade_out_ms,
-                crossfade_to_next_ms: cue.crossfade_to_next_ms,
-            }),
-        );
+        // Only send LOAD_CUE when the media isn't already prerolled from a
+        // STANDBY — otherwise we'd trigger a redundant cold decode and lose
+        // the head start entirely.
+        if !preloaded {
+            broadcast(&self.state, ControllerMsg::LoadCue(load_cue_for(&cue, layer)));
+        }
         broadcast(
             &self.state,
             ControllerMsg::PlayAt(PlayAt {
@@ -113,6 +139,38 @@ impl ControllerApp {
                 crossfade_ms,
             }),
         );
+    }
+
+    /// Preload the selected cue onto the layer the next GO will use, so that
+    /// GO starts instantly. Debounced (so scrolling doesn't thrash clients)
+    /// and gated on the target layer being free (not mid-crossfade). Idempotent
+    /// — re-preloads only when the desired (cue, layer) actually changes.
+    fn maybe_standby(&self) {
+        if self.selected_since.elapsed().as_millis() < SELECTION_SETTLE_MS {
+            return;
+        }
+        let plan = {
+            let s = self.state.lock().unwrap();
+            let Some(show) = &s.show else { return };
+            let Some(idx) = s.selected_cue_idx else { return };
+            let Some(cue) = show.cues.get(idx).cloned() else { return };
+            let target = idle_layer(s.run.active_layer);
+            // Already pre-loaded on the right layer, or the layer is still
+            // finishing a crossfade-out.
+            if s.run.standby.as_ref() == Some(&(cue.id.clone(), target))
+                || now_utc_ms() < s.run.idle_free_utc_ms
+            {
+                return;
+            }
+            (cue, target)
+        };
+        let (cue, target) = plan;
+        {
+            let mut s = self.state.lock().unwrap();
+            s.run.standby = Some((cue.id.clone(), target));
+            s.push_log(format!("STANDBY cue {} on layer {target:?}", cue.id));
+        }
+        broadcast(&self.state, ControllerMsg::Standby(load_cue_for(&cue, target)));
     }
 
     fn move_selection(&self, delta: i64) {
@@ -264,6 +322,16 @@ impl eframe::App for ControllerApp {
                 tail,
             )
         };
+
+        // Track selection changes to debounce speculative preloading, then
+        // (in run mode) preload the settled selection so GO is instant.
+        if self.last_selected != selected {
+            self.last_selected = selected;
+            self.selected_since = Instant::now();
+        }
+        if !self.editor.open {
+            self.maybe_standby();
+        }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
