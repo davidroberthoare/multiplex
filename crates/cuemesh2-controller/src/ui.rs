@@ -9,6 +9,7 @@ use cuemesh2_shared::protocol::{
 };
 use cuemesh2_shared::show::ShowFile;
 
+use crate::editor::{EditorAction, EditorState};
 use crate::preflight;
 use crate::server::{broadcast, now_utc_ms};
 use crate::state::SharedState;
@@ -16,6 +17,7 @@ use crate::state::SharedState;
 pub struct ControllerApp {
     state: SharedState,
     testscreen_on: bool,
+    editor: EditorState,
 }
 
 impl ControllerApp {
@@ -23,6 +25,7 @@ impl ControllerApp {
         let app = Self {
             state,
             testscreen_on: false,
+            editor: EditorState::default(),
         };
         // Auto-load the show named by CUEMESH_SHOW so headless-ish setups
         // (and operators with a fixed show) skip the open dialog entirely.
@@ -139,6 +142,74 @@ impl ControllerApp {
         self.state.lock().unwrap().run = Default::default();
         broadcast(&self.state, ControllerMsg::Stop);
     }
+
+    /// Enter the editor seeded from the running show (or a blank one).
+    fn open_editor(&mut self, blank: bool) {
+        let (show, path) = {
+            let s = self.state.lock().unwrap();
+            (s.show.clone(), s.show_path.clone())
+        };
+        if blank {
+            self.editor.enter(None, None);
+        } else {
+            self.editor.enter(show.as_ref(), path.as_deref());
+        }
+    }
+
+    /// Push an edited show into the running state and re-sync every client.
+    /// Resets run position (cue indices may have changed) and clears preflight.
+    fn apply_show(&self, show: ShowFile) {
+        let empty = show.cues.is_empty();
+        {
+            let mut s = self.state.lock().unwrap();
+            s.show = Some(show);
+            s.selected_cue_idx = if empty { None } else { Some(0) };
+            s.run = Default::default();
+            s.local_media = None;
+            s.push_log("show updated from editor");
+        }
+        // Guard dropped above: `show_sync_msg`/`broadcast` re-lock `state`.
+        if let Some(msg) = crate::server::show_sync_msg(&self.state) {
+            broadcast(&self.state, msg);
+        }
+    }
+
+    /// Render the editor and act on its result. Returns whether edit mode is
+    /// still active (so the caller can skip run-mode panels).
+    fn editor_panel(&mut self, ctx: &egui::Context) {
+        let mut action = EditorAction::None;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            action = self.editor.ui(ui);
+        });
+        match action {
+            EditorAction::None => {}
+            EditorAction::Apply => {
+                let show = self.editor.build();
+                match show.validate() {
+                    Ok(()) => {
+                        self.apply_show(show);
+                        self.editor.set_status("applied to running show");
+                    }
+                    Err(e) => self.editor.set_status(format!("invalid: {e}")),
+                }
+            }
+            EditorAction::Save => match self.editor.save_path() {
+                None => self.editor.set_status("set a save path first"),
+                Some(path) => {
+                    let show = self.editor.build();
+                    match show.save(&path) {
+                        Ok(()) => {
+                            self.state.lock().unwrap().show_path = Some(path.clone());
+                            self.apply_show(show);
+                            self.editor.set_status(format!("saved to {}", path.display()));
+                        }
+                        Err(e) => self.editor.set_status(format!("save failed: {e}")),
+                    }
+                }
+            },
+            EditorAction::Close => self.editor.open = false,
+        }
+    }
 }
 
 fn fmt_ms(ms: u64) -> String {
@@ -151,9 +222,9 @@ impl eframe::App for ControllerApp {
         // 30fps refresh; cheap for our data volume.
         ctx.request_repaint_after(Duration::from_millis(33));
 
-        // Keyboard: space = GO, arrows = move selection. Only when no widget
-        // (e.g. a future text field) wants the keyboard.
-        if !ctx.wants_keyboard_input() {
+        // Keyboard: space = GO, arrows = move selection. Only in run mode and
+        // when no widget (e.g. an editor text field) wants the keyboard.
+        if !self.editor.open && !ctx.wants_keyboard_input() {
             ctx.input(|i| {
                 if i.key_pressed(egui::Key::Space) {
                     self.go_selected();
@@ -235,8 +306,23 @@ impl eframe::App for ControllerApp {
                         },
                     );
                 }
+                ui.separator();
+                if !self.editor.open {
+                    if ui.button("New show").clicked() {
+                        self.open_editor(true);
+                    }
+                    if ui.button("Edit show").clicked() {
+                        self.open_editor(false);
+                    }
+                }
             });
         });
+
+        // Edit mode takes over the body; run-mode panels are hidden.
+        if self.editor.open {
+            self.editor_panel(ctx);
+            return;
+        }
 
         egui::SidePanel::left("cues").min_width(300.0).show(ctx, |ui| {
             ui.heading("Cues");
