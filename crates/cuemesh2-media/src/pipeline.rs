@@ -241,16 +241,56 @@ impl MediaEngine {
         Ok(engine)
     }
 
-    /// Pick the video sink. `glimagesink` scales/converts on the GPU;
-    /// `autovideosink` (usually `xvimagesink` on X11) is the fallback.
+    /// Pick the video sink for the compositor output window.
+    ///
+    /// On Linux we deliberately prefer the non-GL `xvimagesink` (XVideo,
+    /// hardware scaling) over `glimagesink`. The client hosts an `eframe`
+    /// (glow) GL context on its main thread; `glimagesink` spins up a second
+    /// GLX context on a GStreamer thread, and two GLX contexts sharing one X
+    /// display fight each other — the video window ends up mapped but frozen
+    /// (visible in the taskbar, unresponsive, never raising). `xvimagesink`
+    /// has no GL context, so it coexists cleanly. The standalone media
+    /// examples have no eframe context and can still use GL fine.
+    ///
+    /// Override the whole decision with `CUEMESH_VIDEO_SINK=<factory>`.
     fn make_video_sink() -> Result<gst::Element, MediaError> {
-        for factory in ["glimagesink", "autovideosink"] {
+        if let Ok(name) = std::env::var("CUEMESH_VIDEO_SINK") {
+            let name = name.trim();
+            let sink = gst::ElementFactory::make(name)
+                .name("vsink")
+                .build()
+                .map_err(|_| {
+                    MediaError::ElementFactory(format!("CUEMESH_VIDEO_SINK '{name}' unavailable"))
+                })?;
+            tracing::info!(factory = %name, "video sink selected (env override)");
+            Self::configure_video_sink(&sink);
+            return Ok(sink);
+        }
+
+        let candidates: &[&str] = if cfg!(target_os = "windows") {
+            &["d3d11videosink", "glimagesink", "autovideosink"]
+        } else if cfg!(target_os = "macos") {
+            &["glimagesink", "osxvideosink", "autovideosink"]
+        } else {
+            &["xvimagesink", "glimagesink", "ximagesink", "autovideosink"]
+        };
+        for factory in candidates {
             if let Ok(sink) = gst::ElementFactory::make(factory).name("vsink").build() {
                 tracing::info!(%factory, "video sink selected");
+                Self::configure_video_sink(&sink);
                 return Ok(sink);
             }
         }
         Err(MediaError::ElementFactory("no usable video sink".into()))
+    }
+
+    /// Apply properties common to every sink we might pick, guarding each one
+    /// since not all sinks expose all of them.
+    fn configure_video_sink(sink: &gst::Element) {
+        // Letterbox instead of stretching the 16:9 canvas to the window.
+        if sink.find_property("force-aspect-ratio").is_some() {
+            sink.set_property("force-aspect-ratio", true);
+        }
     }
 
     /// One display-side input branch: intervideosrc → caps → queue → comp pad.
