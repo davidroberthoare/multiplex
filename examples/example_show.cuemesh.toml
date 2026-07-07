@@ -15,25 +15,26 @@ hard_seek_threshold_ms = 300
 sync_interval_ms = 1000
 
 [[cues]]
-id = "cue-001"
-name = "Preshow Title"
-type = "image"
-file = "pic1.jpg"
-fade_in_ms = 500
-
-[[cues]]
 id = "cue-002"
 name = "Countdown"
 type = "video"
 file = "countdown.mp4"
 fade_in_ms = 750
+in_ms = 5000
+out_ms = 10000
+loop = true
+on_end = "cut"
 
 [[cues]]
 id = "cue-003"
 name = "Main Video"
 type = "video"
 file = "test1.mp4"
-fade_in_ms = 1000
+fade_in_ms = 2000
+in_ms = 30000
+out_ms = 35000
+loop = false
+on_end = "fade"
 
 [[cues]]
 id = "cue-004"
@@ -42,6 +43,9 @@ type = "color"
 file = ""
 color = "#000000"
 fade_in_ms = 1500
+in_ms = 0
+loop = false
+on_end = "cut"
 
 [[cues]]
 id = "cue-0001"
@@ -50,10 +54,16 @@ type = "color"
 file = ""
 color = "#F20000"
 fade_in_ms = 1500
+in_ms = 0
+loop = false
+on_end = "cut"
 
 [[cues]]
 id = "cue-0002"
 name = "Cue 6"
 type = "video"
 file = "test3.mp4"
-fade_in_ms = 0
+fade_in_ms = 1000
+in_ms = 20000
+loop = false
+on_end = "cut"

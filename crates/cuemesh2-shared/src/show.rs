@@ -46,6 +46,9 @@ pub struct Show {
     pub dropout_policy: DropoutPolicy,
     #[serde(default)]
     pub sync: SyncConfig,
+    /// Optional idle poster (shown on connect and between cues).
+    #[serde(default)]
+    pub poster: Option<Poster>,
 }
 
 /// What a client should do if it loses its controller mid-cue.
@@ -114,17 +117,54 @@ pub struct Cue {
     /// cue. `0` means a hard cut.
     #[serde(default)]
     pub fade_in_ms: u32,
+    /// In-point: start playback this many ms into the file. `0` = the start.
+    #[serde(default)]
+    pub in_ms: u32,
+    /// Out-point: end the cue at this many ms into the file. `None` = play to
+    /// the natural end of the media.
+    #[serde(default)]
+    pub out_ms: Option<u32>,
+    /// Loop the clip (between `in_ms` and `out_ms`/end) until replaced.
+    #[serde(default, rename = "loop")]
+    pub loops: bool,
+    /// What to do when the cue reaches its out-point / natural end.
+    #[serde(default)]
+    pub on_end: EndAction,
     #[serde(default)]
     pub notes: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CueKind {
+    #[default]
     Video,
     Image,
     /// A solid colour (see [`Cue::color`]) — used for fades to black/white.
     Color,
+}
+
+/// What a cue does when it reaches its out-point / the media's natural end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndAction {
+    /// Drop the layer immediately (reveals the poster/black). The default.
+    #[default]
+    Cut,
+    /// Hold the final frame until the operator acts.
+    Freeze,
+    /// Fade the layer out over the cue's `fade_in_ms`, then stop.
+    Fade,
+}
+
+/// A show-level poster: an image or looping video every client shows on connect
+/// and drops back to when no cue is on air. `file` is relative to `media_root`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Poster {
+    /// `video` (looped) or `image`.
+    #[serde(rename = "type")]
+    pub kind: CueKind,
+    pub file: PathBuf,
 }
 
 /// Parse a `#RRGGBB` string into an `[r, g, b]` triple. Returns black on any
@@ -170,6 +210,7 @@ impl ShowFile {
                 media_root: PathBuf::from("~/cuemesh_media"),
                 dropout_policy: DropoutPolicy::default(),
                 sync: SyncConfig::default(),
+                poster: None,
             },
             cues: Vec::new(),
         }
@@ -220,8 +261,9 @@ impl ShowFile {
         Ok(())
     }
 
-    /// Check that every media cue's file exists under the (already-expanded)
-    /// media_root. Colour cues have no file and are skipped.
+    /// Check that every media cue's file (and the poster, if any) exists under
+    /// the (already-expanded) media_root. Colour cues have no file and are
+    /// skipped.
     pub fn validate_media(&self, media_root: &Path) -> Result<(), ShowError> {
         for cue in &self.cues {
             if cue.kind == CueKind::Color {
@@ -231,6 +273,15 @@ impl ShowFile {
             if !full.exists() {
                 return Err(ShowError::MediaMissing {
                     cue_id: cue.id.clone(),
+                    path: full,
+                });
+            }
+        }
+        if let Some(poster) = &self.show.poster {
+            let full = media_root.join(&poster.file);
+            if !full.exists() {
+                return Err(ShowError::MediaMissing {
+                    cue_id: "poster".into(),
                     path: full,
                 });
             }
@@ -295,6 +346,10 @@ crossfade_to_next_ms = 500
             file: PathBuf::from("a.mp4"),
             color: None,
             fade_in_ms: 250,
+            in_ms: 2500,
+            out_ms: Some(15_000),
+            loops: false,
+            on_end: EndAction::Freeze,
             notes: Some("hello".into()),
         });
         sf.cues.push(Cue {
@@ -304,6 +359,10 @@ crossfade_to_next_ms = 500
             file: PathBuf::new(),
             color: Some("#000000".into()),
             fade_in_ms: 1000,
+            in_ms: 0,
+            out_ms: None,
+            loops: false,
+            on_end: EndAction::default(),
             notes: None,
         });
         let tmp = std::env::temp_dir().join("cuemesh2_show_roundtrip.cuemesh.toml");
@@ -312,6 +371,9 @@ crossfade_to_next_ms = 500
         assert_eq!(back.show.title, "Roundtrip");
         assert_eq!(back.cues.len(), 2);
         assert_eq!(back.cues[0].fade_in_ms, 250);
+        assert_eq!(back.cues[0].in_ms, 2500);
+        assert_eq!(back.cues[0].out_ms, Some(15_000));
+        assert_eq!(back.cues[0].on_end, EndAction::Freeze);
         assert_eq!(back.cues[0].notes.as_deref(), Some("hello"));
         assert_eq!(back.cues[1].kind, CueKind::Color);
         assert_eq!(back.cues[1].color.as_deref(), Some("#000000"));
@@ -328,6 +390,10 @@ crossfade_to_next_ms = 500
             file: PathBuf::from("/etc/passwd"),
             color: None,
             fade_in_ms: 0,
+            in_ms: 0,
+            out_ms: None,
+            loops: false,
+            on_end: EndAction::default(),
             notes: None,
         });
         assert!(matches!(sf.validate(), Err(ShowError::InvalidCue { .. })));
@@ -343,6 +409,10 @@ crossfade_to_next_ms = 500
             file: PathBuf::new(),
             color: Some("#000000".into()),
             fade_in_ms: 1500,
+            in_ms: 0,
+            out_ms: None,
+            loops: false,
+            on_end: EndAction::default(),
             notes: None,
         });
         sf.validate().unwrap();

@@ -70,6 +70,16 @@ pub enum MediaKind {
     Image,
 }
 
+/// Per-layer playback window: the in/out points and whether to loop between
+/// them. Preserved across drift seeks (see [`MediaEngine::seek_ms_accurate`])
+/// so a correction never loses the segment. `Default` = play whole clip once.
+#[derive(Debug, Clone, Copy, Default)]
+struct Bounds {
+    start_ms: u64,
+    stop_ms: Option<u64>,
+    looping: bool,
+}
+
 /// Events published on the engine's broadcast channel.
 #[derive(Debug, Clone)]
 pub enum MediaEvent {
@@ -147,6 +157,9 @@ fn channel_name(layer: Layer) -> &'static str {
     }
 }
 
+/// Inter-channel for the background poster layer (below both cue layers).
+const BG_CHANNEL: &str = "cuemesh-layer-bg";
+
 /// A running producer pipeline plus the flag that stops its bus-watch thread.
 struct Producer {
     pipeline: gst::Pipeline,
@@ -165,6 +178,9 @@ struct LayerSlot {
     producer: Mutex<Option<Producer>>,
     /// Handle to the currently running fade task, if any. Aborted on new fade.
     fade: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// In/out/loop window for the current producer. Shared with the producer's
+    /// bus watch so it can re-seek on SEGMENT_DONE to loop.
+    bounds: Arc<Mutex<Bounds>>,
 }
 
 /// Callback invoked from the appsink thread whenever a new composited frame
@@ -227,6 +243,8 @@ struct Inner {
     display: gst::Pipeline,
     layer_a: LayerSlot,
     layer_b: LayerSlot,
+    /// Background poster layer, composited below A and B.
+    poster: LayerSlot,
     canvas: Canvas,
     events_tx: broadcast::Sender<MediaEvent>,
     /// Latest composited frame in RGBA format, for the egui texture path.
@@ -283,10 +301,16 @@ impl MediaEngine {
         gst::Element::link_many([&compositor, &comp_caps, &out_queue, &out_convert, &appsink])
             .map_err(|e| MediaError::LinkElements(e.to_string()))?;
 
-        let layer_a = Self::build_display_input(&display, &compositor, &canvas, Layer::A, 0)?;
-        let layer_b = Self::build_display_input(&display, &compositor, &canvas, Layer::B, 1)?;
+        // Poster at the bottom (zorder 0), cue layers above it (1, 2).
+        let poster = Self::build_display_input(&display, &compositor, &canvas, BG_CHANNEL, "bg", 0)?;
+        let layer_a =
+            Self::build_display_input(&display, &compositor, &canvas, channel_name(Layer::A), "a", 1)?;
+        let layer_b =
+            Self::build_display_input(&display, &compositor, &canvas, channel_name(Layer::B), "b", 2)?;
 
-        // Default: both layers transparent — output is black until a fade-in.
+        // Default: everything transparent — output is black until a fade-in or
+        // a poster loads.
+        poster.compositor_pad.set_property("alpha", 0.0f64);
         layer_a.compositor_pad.set_property("alpha", 0.0f64);
         layer_b.compositor_pad.set_property("alpha", 0.0f64);
 
@@ -296,6 +320,7 @@ impl MediaEngine {
                 display,
                 layer_a,
                 layer_b,
+                poster,
                 canvas,
                 events_tx,
                 latest_frame,
@@ -394,15 +419,12 @@ impl MediaEngine {
         display: &gst::Pipeline,
         compositor: &gst::Element,
         canvas: &Canvas,
-        layer: Layer,
+        channel: &str,
+        suffix: &str,
         zorder: u32,
     ) -> Result<LayerSlot, MediaError> {
-        let suffix = match layer {
-            Layer::A => "a",
-            Layer::B => "b",
-        };
         let src = make("intervideosrc", Some(&format!("inter_src_{suffix}")))?;
-        src.set_property("channel", channel_name(layer));
+        src.set_property("channel", channel);
         // Hold the last frame forever when a producer pauses or dies; "black"
         // is expressed via alpha, never by the channel timing out.
         src.set_property("timeout", u64::MAX);
@@ -431,6 +453,7 @@ impl MediaEngine {
             compositor_pad,
             producer: Mutex::new(None),
             fade: Mutex::new(None),
+            bounds: Arc::new(Mutex::new(Bounds::default())),
         })
     }
 
@@ -463,8 +486,8 @@ impl MediaEngine {
             .map_err(|e| MediaError::BadPath(e.to_string()))?;
 
         tracing::info!(?layer, ?kind, %uri, "load: building producer");
-        let pipeline = self.build_producer(layer, &uri, kind)?;
-        self.install_producer(layer, pipeline, gst::State::Paused)
+        let pipeline = self.build_producer(channel_name(layer), &format!("{layer:?}"), &uri, kind)?;
+        self.install_producer(self.slot(layer), Some(layer), pipeline, gst::State::Paused)
     }
 
     /// Show an SMPTE test pattern on `layer` (replaces any loaded media and
@@ -487,7 +510,7 @@ impl MediaEngine {
         gst::Element::link_many([&src, &convert, &scale, &caps, &sink])
             .map_err(|e| MediaError::LinkElements(e.to_string()))?;
 
-        self.install_producer(layer, pipeline, gst::State::Playing)
+        self.install_producer(self.slot(layer), Some(layer), pipeline, gst::State::Playing)
     }
 
     /// Load a solid-colour cue on `layer`: a `videotestsrc` in solid-colour
@@ -520,18 +543,67 @@ impl MediaEngine {
         gst::Element::link_many([&src, &convert, &scale, &caps, &sink])
             .map_err(|e| MediaError::LinkElements(e.to_string()))?;
 
-        self.install_producer(layer, pipeline, gst::State::Paused)
+        self.install_producer(self.slot(layer), Some(layer), pipeline, gst::State::Paused)
+    }
+
+    /// Load the show's idle poster onto the background layer (composited below
+    /// the cue layers). Video posters loop seamlessly; images hold on their
+    /// single frame. Shown at full alpha immediately — it appears automatically
+    /// whenever both cue layers are transparent, with no idle bookkeeping.
+    pub fn load_poster(&self, path: &Path, kind: MediaKind) -> Result<(), MediaError> {
+        if !path.exists() {
+            return Err(MediaError::BadPath(format!(
+                "poster not found: {}",
+                path.display()
+            )));
+        }
+        let abs = path
+            .canonicalize()
+            .map_err(|e| MediaError::BadPath(format!("{}: {e}", path.display())))?;
+        let uri = gst::glib::filename_to_uri(&abs, None)
+            .map_err(|e| MediaError::BadPath(e.to_string()))?;
+        tracing::info!(?kind, %uri, "poster: building producer");
+        let pipeline = self.build_producer(BG_CHANNEL, "poster", &uri, kind)?;
+        self.install_producer(&self.inner.poster, None, pipeline, gst::State::Paused)?;
+        // Loop video posters; images hold their single frame via imagefreeze.
+        if kind == MediaKind::Video {
+            self.set_slot_bounds(&self.inner.poster, 0, None, true)?;
+        }
+        {
+            let guard = self.inner.poster.producer.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(p) = guard.as_ref() {
+                p.pipeline
+                    .set_state(gst::State::Playing)
+                    .map_err(|e| MediaError::StateChange(format!("poster play: {e}")))?;
+            }
+        }
+        self.inner.poster.compositor_pad.set_property("alpha", 1.0f64);
+        Ok(())
+    }
+
+    /// Remove the idle poster; the background goes transparent (black shows
+    /// through when the cue layers are also transparent).
+    pub fn stop_poster(&self) {
+        self.inner.poster.compositor_pad.set_property("alpha", 0.0f64);
+        let old = {
+            let mut guard = self.inner.poster.producer.lock().unwrap_or_else(|p| p.into_inner());
+            guard.take()
+        };
+        if let Some(old) = old {
+            old.teardown();
+        }
     }
 
     /// Decoder producer: uridecodebin → (imagefreeze) → convert/scale/rate →
     /// canvas caps → intervideosink.
     fn build_producer(
         &self,
-        layer: Layer,
+        channel: &str,
+        name: &str,
         uri: &str,
         kind: MediaKind,
     ) -> Result<gst::Pipeline, MediaError> {
-        let pipeline = gst::Pipeline::with_name(&format!("cuemesh2-producer-{layer:?}"));
+        let pipeline = gst::Pipeline::with_name(&format!("cuemesh2-producer-{name}"));
 
         let decode = make("uridecodebin", Some("decode"))?;
         decode.set_property("uri", uri);
@@ -540,7 +612,7 @@ impl MediaEngine {
         let caps = make("capsfilter", Some("caps"))?;
         caps.set_property("caps", self.inner.canvas.caps());
         let sink = make("intervideosink", Some("inter_sink"))?;
-        sink.set_property("channel", channel_name(layer));
+        sink.set_property("channel", channel);
 
         pipeline
             .add_many([&decode, &convert, &scale, &caps, &sink])
@@ -611,23 +683,30 @@ impl MediaEngine {
         Ok(pipeline)
     }
 
-    /// Swap in a new producer for `layer`, tearing down the old one, and bring
-    /// it to `target` (PAUSED to preroll, PLAYING for live sources).
+    /// Swap in a new producer on `slot`, tearing down the old one, and bring it
+    /// to `target` (PAUSED to preroll, PLAYING for live sources). `event_layer`
+    /// tags EOS/error events for cue layers; the poster passes `None` so its
+    /// pipeline problems only log (and never fire a layer event).
     fn install_producer(
         &self,
-        layer: Layer,
+        slot: &LayerSlot,
+        event_layer: Option<Layer>,
         pipeline: gst::Pipeline,
         target: gst::State,
     ) -> Result<(), MediaError> {
+        // A fresh producer starts with no in/out window; the caller sets one
+        // with `set_bounds` after this returns. Reset so a previous cue's loop
+        // or out-point can't leak onto the new media.
+        *slot.bounds.lock().unwrap_or_else(|p| p.into_inner()) = Bounds::default();
+
         let shutdown = Arc::new(AtomicBool::new(false));
-        self.spawn_producer_bus_watch(layer, &pipeline, shutdown.clone());
+        self.spawn_producer_bus_watch(event_layer, &pipeline, shutdown.clone(), slot.bounds.clone());
 
         let new = Producer {
             pipeline: pipeline.clone(),
             bus_shutdown: shutdown,
         };
         let old = {
-            let slot = self.slot(layer);
             let mut guard = slot.producer.lock().unwrap_or_else(|p| p.into_inner());
             guard.replace(new)
         };
@@ -640,7 +719,7 @@ impl MediaEngine {
             .map_err(|e| MediaError::StateChange(format!("producer set_state({target:?}): {e}")))?;
         // Wait for preroll so failures (bad file, missing decoder) surface here.
         let (result, current, pending) = pipeline.state(gst::ClockTime::from_seconds(5));
-        tracing::info!(?layer, ?result, ?current, ?pending, "producer preroll finished");
+        tracing::info!(?event_layer, ?result, ?current, ?pending, "producer preroll finished");
         if result.is_err() {
             return Err(MediaError::StateChange(format!(
                 "producer preroll failed (state={current:?}) — see bus errors"
@@ -655,8 +734,7 @@ impl MediaEngine {
         layer: Layer,
         f: impl FnOnce(&gst::Pipeline) -> T,
     ) -> Result<T, MediaError> {
-        let slot = self.slot(layer);
-        let guard = slot.producer.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = self.slot(layer).producer.lock().unwrap_or_else(|p| p.into_inner());
         match guard.as_ref() {
             Some(p) => Ok(f(&p.pipeline)),
             None => Err(MediaError::NoProducer(layer)),
@@ -736,18 +814,74 @@ impl MediaEngine {
         })?
     }
 
-    /// Seek a layer to an exact position in ms. Decodes forward from the
-    /// previous keyframe, so it costs more than [`seek_ms`](Self::seek_ms) —
-    /// used for drift hard-resyncs, where a keyframe snap would leave the
-    /// layer as far out of sync as before the seek.
+    /// Seek a layer to an exact position in ms, preserving its in/out window
+    /// and loop flag (see [`set_bounds`](Self::set_bounds)). Decodes forward
+    /// from the previous keyframe, so it costs more than
+    /// [`seek_ms`](Self::seek_ms) — used for drift hard-resyncs, where a
+    /// keyframe snap would leave the layer as far out of sync as before.
     pub fn seek_ms_accurate(&self, layer: Layer, position_ms: u64) -> Result<(), MediaError> {
-        self.with_producer(layer, |p| {
-            p.seek_simple(
-                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                gst::ClockTime::from_mseconds(position_ms),
-            )
-            .map_err(|e| MediaError::StateChange(e.to_string()))
-        })?
+        self.seek_bounds(self.slot(layer), position_ms, true)
+    }
+
+    /// Set the in/out points and loop flag for a layer's current producer, then
+    /// seek to the in-point so playback (and the first prerolled frame) starts
+    /// there. `out_ms = None` plays to the natural end. When `looping`, the
+    /// segment repeats seamlessly via SEGMENT_DONE (no flush, no visible seam).
+    pub fn set_bounds(
+        &self,
+        layer: Layer,
+        in_ms: u64,
+        out_ms: Option<u64>,
+        looping: bool,
+    ) -> Result<(), MediaError> {
+        self.set_slot_bounds(self.slot(layer), in_ms, out_ms, looping)
+    }
+
+    /// [`set_bounds`](Self::set_bounds) on an arbitrary slot (used by the poster).
+    fn set_slot_bounds(
+        &self,
+        slot: &LayerSlot,
+        in_ms: u64,
+        out_ms: Option<u64>,
+        looping: bool,
+    ) -> Result<(), MediaError> {
+        {
+            let mut guard = slot.bounds.lock().unwrap_or_else(|p| p.into_inner());
+            *guard = Bounds {
+                start_ms: in_ms,
+                stop_ms: out_ms,
+                looping,
+            };
+        }
+        self.seek_bounds(slot, in_ms, true)
+    }
+
+    /// Seek to `position_ms` within the slot's stored bounds. `flush = true` for
+    /// a user/drift seek; `false` for the gapless loop re-seek on SEGMENT_DONE.
+    fn seek_bounds(&self, slot: &LayerSlot, position_ms: u64, flush: bool) -> Result<(), MediaError> {
+        let b = *slot.bounds.lock().unwrap_or_else(|p| p.into_inner());
+        let mut flags = gst::SeekFlags::ACCURATE;
+        if flush {
+            flags |= gst::SeekFlags::FLUSH;
+        }
+        if b.looping {
+            // SEGMENT makes the pipeline post SEGMENT_DONE at the stop point
+            // instead of EOS, which the bus watch turns into a loop.
+            flags |= gst::SeekFlags::SEGMENT;
+        }
+        let start = Some(gst::ClockTime::from_mseconds(position_ms));
+        let (stop_type, stop) = match b.stop_ms {
+            Some(s) => (gst::SeekType::Set, Some(gst::ClockTime::from_mseconds(s))),
+            None => (gst::SeekType::None, gst::ClockTime::NONE),
+        };
+        let guard = slot.producer.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_ref() {
+            Some(p) => p
+                .pipeline
+                .seek(1.0, flags, gst::SeekType::Set, start, stop_type, stop)
+                .map_err(|e| MediaError::StateChange(e.to_string())),
+            None => Ok(()),
+        }
     }
 
     /// Adjust playback rate on a layer. Used by drift correction every few
@@ -895,16 +1029,20 @@ impl MediaEngine {
     }
 
     /// Per-producer bus watch. Exits when the producer is torn down.
+    /// `event_layer` is `Some` for cue layers (EOS/error become layer events)
+    /// and `None` for the poster (problems only log; loops still work).
     fn spawn_producer_bus_watch(
         &self,
-        layer: Layer,
+        event_layer: Option<Layer>,
         pipeline: &gst::Pipeline,
         shutdown: Arc<AtomicBool>,
+        bounds: Arc<Mutex<Bounds>>,
     ) {
         let Some(bus) = pipeline.bus() else { return };
         let tx = self.inner.events_tx.clone();
+        let loop_pipeline = pipeline.clone();
         std::thread::Builder::new()
-            .name(format!("cuemesh2-producer-bus-{layer:?}"))
+            .name("cuemesh2-producer-bus".into())
             .spawn(move || {
                 while !shutdown.load(Ordering::SeqCst) {
                     let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(300)) else {
@@ -913,8 +1051,32 @@ impl MediaEngine {
                     use gst::MessageView as M;
                     match msg.view() {
                         M::Eos(_) => {
-                            tracing::info!(?layer, "producer: EOS");
-                            let _ = tx.send(MediaEvent::Eos(layer));
+                            tracing::info!(?event_layer, "producer: EOS");
+                            if let Some(layer) = event_layer {
+                                let _ = tx.send(MediaEvent::Eos(layer));
+                            }
+                        }
+                        // End of a looping segment: re-seek (non-flushing, so
+                        // no visible seam) back to the in-point to loop.
+                        M::SegmentDone(_) => {
+                            let b = *bounds.lock().unwrap_or_else(|p| p.into_inner());
+                            if b.looping {
+                                let start = Some(gst::ClockTime::from_mseconds(b.start_ms));
+                                let (stop_type, stop) = match b.stop_ms {
+                                    Some(s) => {
+                                        (gst::SeekType::Set, Some(gst::ClockTime::from_mseconds(s)))
+                                    }
+                                    None => (gst::SeekType::None, gst::ClockTime::NONE),
+                                };
+                                let _ = loop_pipeline.seek(
+                                    1.0,
+                                    gst::SeekFlags::SEGMENT,
+                                    gst::SeekType::Set,
+                                    start,
+                                    stop_type,
+                                    stop,
+                                );
+                            }
                         }
                         M::Error(err) => {
                             let source = err
@@ -922,15 +1084,17 @@ impl MediaEngine {
                                 .map(|s| s.path_string().to_string())
                                 .unwrap_or_else(|| "unknown".into());
                             let dbg = err.debug().map(|d| d.to_string()).unwrap_or_default();
-                            tracing::error!(?layer, source = %source, error = %err.error(), debug = %dbg, "producer: ERROR");
-                            let _ = tx.send(MediaEvent::Error {
-                                layer,
-                                source,
-                                message: err.error().to_string(),
-                            });
+                            tracing::error!(?event_layer, source = %source, error = %err.error(), debug = %dbg, "producer: ERROR");
+                            if let Some(layer) = event_layer {
+                                let _ = tx.send(MediaEvent::Error {
+                                    layer,
+                                    source,
+                                    message: err.error().to_string(),
+                                });
+                            }
                         }
                         M::Warning(w) => {
-                            tracing::warn!(?layer, warning = %w.error(), "producer: WARNING");
+                            tracing::warn!(?event_layer, warning = %w.error(), "producer: WARNING");
                         }
                         _ => {}
                     }
@@ -942,7 +1106,7 @@ impl MediaEngine {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        for slot in [&self.layer_a, &self.layer_b] {
+        for slot in [&self.layer_a, &self.layer_b, &self.poster] {
             if let Ok(mut guard) = slot.producer.lock() {
                 if let Some(p) = guard.take() {
                     p.teardown();
@@ -1006,6 +1170,17 @@ mod tests {
         assert!(engine.is_loaded(Layer::B));
         engine.stop(Layer::B);
         assert!(!engine.is_loaded(Layer::B));
+    }
+
+    #[test]
+    fn stop_poster_without_load_is_noop() {
+        // The background poster layer exists from construction; tearing it down
+        // when nothing is loaded must be harmless and leave it transparent.
+        let engine = MediaEngine::new().expect("build");
+        engine.stop_poster();
+        assert!((engine.inner.poster.compositor_pad.property::<f64>("alpha")).abs() < 1e-6);
+        // Loading a missing poster errors cleanly rather than panicking.
+        assert!(engine.load_poster(Path::new("/no/such/poster.png"), MediaKind::Image).is_err());
     }
 }
 

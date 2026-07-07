@@ -189,6 +189,10 @@ mod tests {
             file: PathBuf::from(file),
             color: None,
             fade_in_ms: 0,
+            in_ms: 0,
+            out_ms: None,
+            loops: false,
+            on_end: cuemesh2_shared::show::EndAction::default(),
             notes: None,
         }
     }

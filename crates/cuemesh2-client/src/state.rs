@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cuemesh2_shared::protocol::{ClientState, ShowSync};
+use cuemesh2_shared::show::EndAction;
 
 #[derive(Debug, Default)]
 pub struct AppState {
@@ -52,6 +53,16 @@ pub struct LayerInfo {
     /// Wall-clock start (controller UTC ms) of the running cue, for drift.
     pub master_start_utc_ms: Option<u64>,
     pub playing: bool,
+    /// In-point (ms into the media) that `master_start_utc_ms` maps to.
+    pub in_ms: u64,
+    /// Out-point (ms into the media); `None` = natural end.
+    pub out_ms: Option<u64>,
+    /// Whether this cue loops between in/out.
+    pub loops: bool,
+    /// What to do when the cue reaches its out-point / natural end.
+    pub on_end: EndAction,
+    /// The cue's fade duration, used for an `on_end == Fade` fade-out.
+    pub fade_ms: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

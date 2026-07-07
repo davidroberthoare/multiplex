@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::show::{Cue, CueKind, DropoutPolicy, SyncConfig};
+use crate::show::{Cue, CueKind, DropoutPolicy, EndAction, Poster, SyncConfig};
 
 /// Envelope wrapping any protocol message with the sender's UTC timestamp.
 ///
@@ -109,6 +109,9 @@ pub struct ShowSync {
     pub title: String,
     pub dropout_policy: DropoutPolicy,
     pub sync: SyncConfig,
+    /// Idle poster, if the show defines one. Clients load it on connect.
+    #[serde(default)]
+    pub poster: Option<Poster>,
     pub cues: Vec<Cue>,
 }
 
@@ -127,10 +130,18 @@ pub struct LoadCue {
     /// Solid colour (`#RRGGBB`) for `color` cues; ignored otherwise.
     #[serde(default)]
     pub color: Option<String>,
+    /// In-point (ms into the file). `None`/`0` starts at the beginning.
     #[serde(default)]
     pub start_ms: Option<u64>,
+    /// Out-point (ms into the file). `None` plays to the natural end.
     #[serde(default)]
     pub end_ms: Option<u64>,
+    /// Loop between in/out until replaced.
+    #[serde(default)]
+    pub loops: bool,
+    /// What to do at the out-point / natural end.
+    #[serde(default)]
+    pub on_end: EndAction,
     #[serde(default)]
     pub fade_in_ms: u32,
 }
@@ -372,8 +383,10 @@ mod tests {
                 file: PathBuf::from("intro.mp4"),
                 kind: CueKind::Video,
                 color: None,
-                start_ms: None,
+                start_ms: Some(2_500),
                 end_ms: Some(30_000),
+                loops: true,
+                on_end: EndAction::Freeze,
                 fade_in_ms: 500,
             }),
         );
@@ -384,6 +397,10 @@ mod tests {
                 assert_eq!(c.cue_id, "cue-1");
                 assert_eq!(c.layer, Layer::A);
                 assert_eq!(c.kind, CueKind::Video);
+                assert_eq!(c.start_ms, Some(2_500));
+                assert_eq!(c.end_ms, Some(30_000));
+                assert!(c.loops);
+                assert_eq!(c.on_end, EndAction::Freeze);
                 assert_eq!(c.fade_in_ms, 500);
             }
             _ => panic!("wrong variant"),
@@ -402,6 +419,8 @@ mod tests {
                 color: None,
                 start_ms: None,
                 end_ms: None,
+                loops: false,
+                on_end: EndAction::default(),
                 fade_in_ms: 500,
             }),
         );
@@ -461,6 +480,10 @@ mod tests {
                 title: "T".into(),
                 dropout_policy: DropoutPolicy::Freeze,
                 sync: SyncConfig::default(),
+                poster: Some(Poster {
+                    kind: CueKind::Image,
+                    file: PathBuf::from("poster.jpg"),
+                }),
                 cues: vec![Cue {
                     id: "c1".into(),
                     name: "One".into(),
@@ -468,6 +491,10 @@ mod tests {
                     file: PathBuf::from("a.jpg"),
                     color: None,
                     fade_in_ms: 0,
+                    in_ms: 0,
+                    out_ms: None,
+                    loops: false,
+                    on_end: EndAction::default(),
                     notes: None,
                 }],
             }),
@@ -478,6 +505,7 @@ mod tests {
             ControllerMsg::ShowSync(s) => {
                 assert_eq!(s.title, "T");
                 assert_eq!(s.dropout_policy, DropoutPolicy::Freeze);
+                assert_eq!(s.poster.as_ref().map(|p| p.file.clone()), Some(PathBuf::from("poster.jpg")));
                 assert_eq!(s.cues.len(), 1);
                 assert_eq!(s.cues[0].kind, CueKind::Image);
             }

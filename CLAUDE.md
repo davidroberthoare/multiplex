@@ -107,7 +107,10 @@ Layer A: filesrc → decodebin → videoconvert → videoscale → alpha ─┐
 Layer B: filesrc → decodebin → videoconvert → videoscale → alpha ─┘
 ```
 
-Two layers is the entire scope. That gives us:
+(A third, always-below **background layer** carries the optional show poster —
+see the Poster note under Network Protocol. It is not a cue layer.)
+
+Two cue layers is the entire scope. That gives us:
 - **Fade from black** — start layer A at alpha 0, ramp to 1.
 - **Fade to black** — ramp layer A alpha to 0.
 - **Crossfade to next cue** — preload layer B, ramp A down and B up simultaneously.
@@ -256,12 +259,21 @@ rate_max = 1.05
 hard_seek_threshold_ms = 300
 sync_interval_ms = 1000
 
+# Optional idle poster: image or looping video shown on connect / between cues.
+[show.poster]
+type = "image"                 # image | video (video loops)
+file = "poster.jpg"
+
 [[cues]]
 id = "cue-001"                 # auto-generated; hidden in the editor UI
 name = "Opening"
 type = "video"                 # video | image | color
 file = "opening.webm"          # relative to media_root (omit for color cues)
 fade_in_ms = 500               # fade-from-black, or crossfade-in when a cue is on air
+in_ms = 2500                   # start 2.5s into the file (video only)
+out_ms = 15000                 # end at 15s; omit to play to natural end (video only)
+loop = false                   # loop between in/out until replaced (video only)
+on_end = "cut"                 # cut | freeze | fade — what happens at the out-point
 
 [[cues]]
 id = "cue-002"
@@ -273,6 +285,22 @@ fade_in_ms = 1500
 
 `default_fade_ms` and the `[show.settings]` table were removed; the operator
 BLACKOUT/FADE command uses a fixed `DEFAULT_FADE_MS` constant.
+
+**In/out/loop** are implemented as GStreamer segment seeks stored per layer
+(`MediaEngine::set_bounds`) and preserved across drift hard-seeks; looping
+re-seeks on `SEGMENT_DONE` for a seamless seam. The client's drift corrector
+maps master wall-clock onto the `[in, out]` window (modulo the loop length for
+looped cues). **`on_end`** is applied by the client when the layer EOSes at the
+out-point: `cut` stops it, `freeze` holds the last frame, `fade` fades out over
+the cue's `fade_in_ms`.
+
+**Poster** is a **dedicated background layer** in the media engine, composited
+*below* cue layers A and B (`MediaEngine::load_poster` / `stop_poster`, fed by
+its own `intervideosrc` at zorder 0). The client (re)loads it purely from
+`ShowSync` — on connect and on every show update — and then leaves it alone: it
+shows through automatically whenever both cue layers are transparent (nothing
+playing, or an armed-but-not-yet-played cue at alpha 0), with no idle
+bookkeeping. Video posters loop seamlessly; images hold.
 
 Loaded and validated with `serde` + `toml`. Validation: unique cue IDs, file existence relative to `media_root`, enum variants, sensible ranges.
 

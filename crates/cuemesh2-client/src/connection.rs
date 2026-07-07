@@ -24,7 +24,9 @@ use cuemesh2_shared::protocol::{
     MediaPushProgress, MediaPushResult, MediaReport, MediaReportEntry, Ready, Status, SyncReply,
     PROTOCOL_VERSION,
 };
-use cuemesh2_shared::show::{parse_hex_color, CueKind, DropoutPolicy, DEFAULT_FADE_MS};
+use cuemesh2_shared::show::{
+    parse_hex_color, CueKind, DropoutPolicy, EndAction, Poster, DEFAULT_FADE_MS,
+};
 use cuemesh2_shared::{hashing, transfer};
 
 use crate::state::{PlaybackState, SharedState};
@@ -72,8 +74,8 @@ fn other_layer(l: WireLayer) -> WireLayer {
 }
 
 pub async fn run(cfg: ConnectionConfig, state: SharedState, engine: MediaEngine) {
-    spawn_media_event_pump(engine.clone(), state.clone());
     let cfg = Arc::new(cfg);
+    spawn_media_event_pump(engine.clone(), state.clone(), cfg.clone());
     let mut backoff_ms = 500u64;
     loop {
         // The UI may have picked a different controller (mDNS or manual).
@@ -296,8 +298,13 @@ fn spawn_status_loop(
                     let ml = media_layer(wire);
                     let Some(actual) = engine.position_ms(ml) else { continue };
 
+                    let in_ms = info.in_ms;
+                    let looping = info.loops;
+
                     // Plateau detector: if the position has stopped advancing
                     // while the controller expects it to, the clip has ended.
+                    // Looping clips legitimately jump backwards at the seam, so
+                    // the "regressed → ended" heuristic must not apply to them.
                     let ds = drift_state.entry(wire).or_default();
                     // Reset when a new PLAY_AT (new master_start_utc_ms)
                     // gives us a fresh cue to track.
@@ -308,40 +315,42 @@ fn spawn_status_loop(
                     if ds.ended {
                         continue;
                     }
-                    if let Some(prev) = ds.prev_actual {
-                        // Position went backwards after a seek — the clip has
-                        // ended (seek past EOS reset to keyframe at 0).
-                        if actual < prev {
-                            tracing::info!(
-                                ?wire,
-                                prev,
-                                actual,
-                                "drift: position regressed after seek — clip ended"
-                            );
-                            ds.ended = true;
-                            continue;
-                        }
-                        // Much less progress than expected means we're stuck
-                        // near the end of the clip (appsink throttled or
-                        // decoder hit the final keyframe).
-                        if actual < prev + PLATEAU_THRESHOLD_MS {
-                            ds.stagnant_ticks += 1;
-                            if ds.stagnant_ticks >= 2 {
+                    if !looping {
+                        if let Some(prev) = ds.prev_actual {
+                            // Position went backwards after a seek — the clip has
+                            // ended (seek past EOS reset to keyframe at 0).
+                            if actual < prev {
                                 tracing::info!(
                                     ?wire,
                                     prev,
                                     actual,
-                                    stagnant = ds.stagnant_ticks,
-                                    "drift: layer appears ended — disabling correction"
+                                    "drift: position regressed after seek — clip ended"
                                 );
                                 ds.ended = true;
                                 continue;
                             }
-                        } else {
-                            ds.stagnant_ticks = 0;
+                            // Much less progress than expected means we're stuck
+                            // near the end of the clip (appsink throttled or
+                            // decoder hit the final keyframe).
+                            if actual < prev + PLATEAU_THRESHOLD_MS {
+                                ds.stagnant_ticks += 1;
+                                if ds.stagnant_ticks >= 2 {
+                                    tracing::info!(
+                                        ?wire,
+                                        prev,
+                                        actual,
+                                        stagnant = ds.stagnant_ticks,
+                                        "drift: layer appears ended — disabling correction"
+                                    );
+                                    ds.ended = true;
+                                    continue;
+                                }
+                            } else {
+                                ds.stagnant_ticks = 0;
+                            }
                         }
+                        ds.prev_actual = Some(actual);
                     }
-                    ds.prev_actual = Some(actual);
 
                     // A clip with no seekable timeline (a still image via
                     // imagefreeze) or whose duration isn't known yet can't be
@@ -349,22 +358,42 @@ fn spawn_status_loop(
                     let Some(duration) = engine.duration_ms(ml).filter(|d| *d > 0) else {
                         continue;
                     };
-                    // Controller "now" through our filtered offset.
-                    let controller_now = now_utc_ms() as i64 - offset;
-                    let expected = controller_now - start as i64;
-                    if expected < 0 {
-                        continue; // cue hasn't nominally started yet
-                    }
-                    // The cue has been on air longer than its media is long:
-                    // the clip is holding its last frame (or about to EOS on its
-                    // own). `expected` now races past the media forever, so
-                    // "drift" reads as a huge, ever-growing negative and the old
-                    // code hard-seeked past the end every tick — visibly
-                    // resetting playback. There is nothing to correct here.
-                    if expected as u64 + SEEK_MARGIN_MS >= duration {
+                    // The effective end is the out-point, clamped to the media.
+                    let effective_end = info.out_ms.unwrap_or(duration).min(duration);
+                    if effective_end <= in_ms {
                         continue;
                     }
-                    let drift = actual as i64 - expected;
+                    // Controller "now" through our filtered offset, as elapsed
+                    // time since this cue nominally started.
+                    let controller_now = now_utc_ms() as i64 - offset;
+                    let elapsed = controller_now - start as i64;
+                    if elapsed < 0 {
+                        continue; // cue hasn't nominally started yet
+                    }
+                    let elapsed = elapsed as u64;
+
+                    // Map master time onto the in/out window: where the media
+                    // *should* be now, plus the drift against where it is
+                    // (wrapping across the loop seam for looping cues).
+                    let (expected_media, drift) = if looping {
+                        let loop_len = effective_end - in_ms;
+                        let em = in_ms + (elapsed % loop_len);
+                        let mut d = actual as i64 - em as i64;
+                        if d > loop_len as i64 / 2 {
+                            d -= loop_len as i64;
+                        } else if d < -(loop_len as i64 / 2) {
+                            d += loop_len as i64;
+                        }
+                        (em, d)
+                    } else {
+                        let em = in_ms + elapsed;
+                        // Past the out-point: the engine EOSes on its own and the
+                        // on-end action fires; nothing to correct here.
+                        if em + SEEK_MARGIN_MS >= effective_end {
+                            continue;
+                        }
+                        (em, actual as i64 - em as i64)
+                    };
                     {
                         let mut s = state.lock().unwrap();
                         s.last_drift_ms = Some(drift);
@@ -403,10 +432,9 @@ fn spawn_status_loop(
                             }
                         }
                         Correction::HardSeek(_) => {
-                            // Never seek past the end (guarded above, but clamp
-                            // defensively so we always land on real media).
-                            let target = (expected.max(0) as u64)
-                                .min(duration.saturating_sub(SEEK_MARGIN_MS));
+                            // Land on real media inside the [in, out] window.
+                            let target = expected_media
+                                .clamp(in_ms, effective_end.saturating_sub(SEEK_MARGIN_MS));
                             tracing::info!(?wire, drift, target, "hard seek to correct drift");
                             // Accurate, not keyframe-snapped: a KEY_UNIT seek
                             // can land a whole GOP short of the target, which
@@ -476,12 +504,26 @@ fn preload_cue(
     };
     match load_result {
         Ok(_) => {
+            let in_ms = c.start_ms.unwrap_or(0);
+            // Apply the in/out/loop window (video only; stills/colour have no
+            // meaningful timeline). Skip the seek entirely for a plain
+            // whole-clip cue so we don't pay a needless flush at load.
+            if c.kind == CueKind::Video && (in_ms > 0 || c.end_ms.is_some() || c.loops) {
+                if let Err(e) = engine.set_bounds(ml, in_ms, c.end_ms, c.loops) {
+                    log(state, format!("{why} set_bounds failed: {e}"));
+                }
+            }
             {
                 let mut s = state.lock().unwrap();
                 let info = s.layer_mut(c.layer);
                 info.cue_id = Some(c.cue_id.clone());
                 info.master_start_utc_ms = None;
                 info.playing = false;
+                info.in_ms = in_ms;
+                info.out_ms = c.end_ms;
+                info.loops = c.loops;
+                info.on_end = c.on_end;
+                info.fade_ms = c.fade_in_ms;
                 s.playback.state = PlaybackState::Ready;
             }
             let _ = outbound.try_send(ClientMsg::Ready(Ready {
@@ -514,6 +556,9 @@ async fn handle_controller_msg(
                 format!("show sync: \"{}\" ({} cues, dropout {:?})", show.title, show.cues.len(), show.dropout_policy),
             );
             state.lock().unwrap().show = Some(show);
+            // (Re)load the show's background poster; it shows through whenever
+            // no cue is visible.
+            apply_poster(state, engine, cfg);
         }
         ControllerMsg::LoadCue(c) => preload_cue(c, "LOAD_CUE", cfg, state, engine, outbound),
         ControllerMsg::Standby(c) => preload_cue(c, "STANDBY", cfg, state, engine, outbound),
@@ -862,24 +907,71 @@ async fn finish_transfer(
     }));
 }
 
+/// (Re)load or clear the show's idle poster on the engine's background layer,
+/// per the current show. The poster sits below the cue layers, so it appears
+/// automatically whenever both are transparent — no idle bookkeeping needed.
+/// Called on connect / every SHOW_SYNC (show load or update).
+fn apply_poster(state: &SharedState, engine: &MediaEngine, cfg: &Arc<ConnectionConfig>) {
+    let poster: Option<Poster> = state.lock().unwrap().show.as_ref().and_then(|sh| sh.poster.clone());
+    match poster {
+        Some(p) => {
+            let full = cfg.media_root.join(&p.file);
+            let kind = if p.kind == CueKind::Video {
+                MediaKind::Video
+            } else {
+                MediaKind::Image
+            };
+            match engine.load_poster(&full, kind) {
+                Ok(_) => log(state, format!("idle poster loaded ({})", full.display())),
+                Err(e) => log(state, format!("poster load failed: {e}")),
+            }
+        }
+        None => engine.stop_poster(),
+    }
+}
+
 /// Forward pipeline events (errors, EOS) into the UI log and layer state.
-fn spawn_media_event_pump(engine: MediaEngine, state: SharedState) {
+fn spawn_media_event_pump(engine: MediaEngine, state: SharedState, _cfg: Arc<ConnectionConfig>) {
     let mut rx = engine.subscribe();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(MediaEvent::Eos(layer)) => {
-                    log(&state, format!("engine: EOS on layer {layer:?}"));
-                    // A finished cue leaves the layer showing its last frame;
-                    // retire the producer and mark the layer idle. The
-                    // operator (or the next GO) decides what happens next.
-                    engine.stop(layer);
                     let wire = match layer {
                         cuemesh2_media::Layer::A => WireLayer::A,
                         cuemesh2_media::Layer::B => WireLayer::B,
                     };
-                    let mut s = state.lock().unwrap();
-                    *s.layer_mut(wire) = Default::default();
+                    let on_end = state.lock().unwrap().layer_mut(wire).on_end;
+                    log(&state, format!("engine: EOS on layer {layer:?} → {on_end:?}"));
+                    match on_end {
+                        EndAction::Freeze => {
+                            // Hold the last frame: leave the producer and alpha
+                            // as-is, just stop tracking it for drift.
+                            let mut s = state.lock().unwrap();
+                            let info = s.layer_mut(wire);
+                            info.playing = false;
+                            info.master_start_utc_ms = None;
+                        }
+                        EndAction::Cut => {
+                            // Drop the layer; the background poster (or black)
+                            // shows through automatically.
+                            engine.stop(layer);
+                            *state.lock().unwrap().layer_mut(wire) = Default::default();
+                        }
+                        EndAction::Fade => {
+                            let fade_ms =
+                                state.lock().unwrap().layer_mut(wire).fade_ms.max(1);
+                            let dur = Duration::from_millis(fade_ms as u64);
+                            fades::fade(&engine, layer, 0.0, dur);
+                            let engine2 = engine.clone();
+                            let state2 = state.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(dur + Duration::from_millis(50)).await;
+                                engine2.stop(layer);
+                                *state2.lock().unwrap().layer_mut(wire) = Default::default();
+                            });
+                        }
+                    }
                 }
                 Ok(MediaEvent::Error { layer, source, message }) => {
                     log(&state, format!("engine ERROR layer {layer:?} [{source}]: {message}"));
