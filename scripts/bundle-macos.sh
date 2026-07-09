@@ -29,7 +29,9 @@ dylibbundler -od -b -x "$BINDIR/cuemesh2-client" \
   -d "$LIBDIR" -p @executable_path/../lib/
 
 echo "==> Copying GStreamer plugins ..."
-GST_FRAMEWORK="/Library/Frameworks/GStreamer.framework/Versions/Current"
+# Versions/1.0 is where the .pkg actually installs; the Versions/Current
+# symlink is not reliably present on CI runners.
+GST_FRAMEWORK="/Library/Frameworks/GStreamer.framework/Versions/1.0"
 GST_PLUGIN_DIR="${GST_FRAMEWORK}/lib/gstreamer-1.0"
 if [ -d "$GST_PLUGIN_DIR" ]; then
   cp -a "$GST_PLUGIN_DIR"/. "$PLUGDIR/"
