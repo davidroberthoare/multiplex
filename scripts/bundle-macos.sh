@@ -17,22 +17,28 @@ echo "==> Copying universal binaries ..."
 cp target/release/cuemesh2-controller "$BINDIR/"
 cp target/release/cuemesh2-client "$BINDIR/"
 
+# Versions/1.0 is where the .pkg actually installs; the Versions/Current
+# symlink is not reliably present on CI runners.
+GST_FRAMEWORK="/Library/Frameworks/GStreamer.framework/Versions/1.0"
+GST_PLUGIN_DIR="${GST_FRAMEWORK}/lib/gstreamer-1.0"
+
 echo "==> Bundling GStreamer dylibs with dylibbundler ..."
 # -od  = overwrite destination
 # -b   = backup existing (not needed with -od)
 # -x   = fix the given executable
 # -d   = dylib destination directory
 # -p   = path prefix to embed in the binary
-dylibbundler -od -b -x "$BINDIR/cuemesh2-controller" \
-  -d "$LIBDIR" -p @executable_path/../lib/
-dylibbundler -od -b -x "$BINDIR/cuemesh2-client" \
-  -d "$LIBDIR" -p @executable_path/../lib/
+# -s   = where to resolve @rpath/... references (gstreamer-rs links the
+#        client against @rpath/libgst*.dylib); without it dylibbundler
+#        prompts interactively for the path, which hangs forever in CI.
+# echo quit | : belt-and-suspenders — if a prompt still appears, abort
+#        with an error instead of hanging.
+echo quit | dylibbundler -od -b -x "$BINDIR/cuemesh2-controller" \
+  -d "$LIBDIR" -p @executable_path/lib/ -s "${GST_FRAMEWORK}/lib"
+echo quit | dylibbundler -od -b -x "$BINDIR/cuemesh2-client" \
+  -d "$LIBDIR" -p @executable_path/lib/ -s "${GST_FRAMEWORK}/lib"
 
 echo "==> Copying GStreamer plugins ..."
-# Versions/1.0 is where the .pkg actually installs; the Versions/Current
-# symlink is not reliably present on CI runners.
-GST_FRAMEWORK="/Library/Frameworks/GStreamer.framework/Versions/1.0"
-GST_PLUGIN_DIR="${GST_FRAMEWORK}/lib/gstreamer-1.0"
 if [ -d "$GST_PLUGIN_DIR" ]; then
   cp -a "$GST_PLUGIN_DIR"/. "$PLUGDIR/"
 else
