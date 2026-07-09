@@ -83,11 +83,16 @@ jobs:
       - name: Install GStreamer (macOS)
         if: runner.os == 'macOS'
         run: |
-          curl -fsSL "https://gstreamer.freedesktop.org/data/pkg/osx/${{ env.GST_VERSION }}/gstreamer-1.0-devel-${{ env.GST_VERSION }}-universal.pkg" -o /tmp/gst-dev.pkg
-          sudo installer -verboseR -pkg /tmp/gst-dev.pkg -target /
-          # Also install the runtime .pkg (needed for dylib bundling)
+          # ORDER MATTERS: runtime first, devel second. The runtime pkg's
+          # osx-framework sub-package declares Versions/1.0 as a bundle with
+          # <upgrade-bundle> semantics, so installing it over an existing
+          # framework REPLACES the whole directory — with devel installed
+          # first, its headers/.pc files get silently wiped while its pkg
+          # receipts survive, which made this maddening to diagnose.
           curl -fsSL "https://gstreamer.freedesktop.org/data/pkg/osx/${{ env.GST_VERSION }}/gstreamer-1.0-${{ env.GST_VERSION }}-universal.pkg" -o /tmp/gst-runtime.pkg
           sudo installer -verboseR -pkg /tmp/gst-runtime.pkg -target /
+          curl -fsSL "https://gstreamer.freedesktop.org/data/pkg/osx/${{ env.GST_VERSION }}/gstreamer-1.0-devel-${{ env.GST_VERSION }}-universal.pkg" -o /tmp/gst-dev.pkg
+          sudo installer -verboseR -pkg /tmp/gst-dev.pkg -target /
           brew install dylibbundler
           # Fail here, with a map of what actually landed, rather than
           # letting cargo produce a less helpful pkg-config error later.
