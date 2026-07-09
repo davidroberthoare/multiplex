@@ -16,7 +16,7 @@
 //!
 //! See `CLAUDE.md` at the workspace root for the design brief.
 
-use cuemesh2_client::{connection, discovery, state, ui};
+use cuemesh2_client::{connection, discovery, state, ui, update};
 use cuemesh2_media::{Canvas, MediaEngine};
 
 /// Parse `WxH@FPS` (e.g. `1280x720@30`); None on any malformed part.
@@ -38,6 +38,10 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // A verified update staged by a previous run applies before anything
+    // else touches the pipeline or the network; on success this re-execs.
+    update::apply_staged_at_startup();
 
     let controller_url = std::env::var("CUEMESH_CONTROLLER")
         .unwrap_or_else(|_| "ws://127.0.0.1:9420".to_string());

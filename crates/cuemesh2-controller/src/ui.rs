@@ -14,7 +14,8 @@ use cuemesh2_shared::show::{CueKind, ShowFile};
 use crate::editor::{EditorAction, EditorState};
 use crate::preflight;
 use crate::server::{broadcast, load_cue_for, now_utc_ms};
-use crate::state::SharedState;
+use crate::state::{ClientUpdate, SelfUpdate, SharedState};
+use crate::update;
 
 /// A file dialog pre-filtered to CueMesh show files.
 fn show_dialog() -> FileDialog {
@@ -330,7 +331,17 @@ impl eframe::App for ControllerApp {
             });
         }
 
-        let (show_summary, cues, playing_idx, selected, clients, preflight_running, log_tail) = {
+        let (
+            show_summary,
+            cues,
+            playing_idx,
+            selected,
+            clients,
+            preflight_running,
+            log_tail,
+            update_manifest,
+            self_update,
+        ) = {
             let s = self.state.lock().unwrap();
             let show_summary = match &s.show {
                 Some(sf) => format!("{}  ({} cues)", sf.show.title, sf.cues.len()),
@@ -354,6 +365,8 @@ impl eframe::App for ControllerApp {
                 clients,
                 s.preflight_running,
                 tail,
+                s.update_manifest.clone(),
+                s.self_update.clone(),
             )
         };
 
@@ -415,6 +428,63 @@ impl eframe::App for ControllerApp {
                         self.open_editor(false);
                     }
                 }
+                ui.separator();
+                // Two independent operator actions: update the controller
+                // itself (needs internet, also refreshes the client bundle),
+                // then optionally update the fleet from the local bundle.
+                match &self_update {
+                    SelfUpdate::Idle | SelfUpdate::Failed(_) => {
+                        if ui
+                            .button(format!("{}  Update controller", icon::DOWNLOAD_SIMPLE))
+                            .on_hover_text(format!(
+                                "v{} — check the release server for a newer version",
+                                update::APP_VERSION
+                            ))
+                            .clicked()
+                        {
+                            update::start_self_update(&self.state);
+                        }
+                        if let SelfUpdate::Failed(e) = &self_update {
+                            ui.colored_label(egui::Color32::from_rgb(220, 70, 70), icon::WARNING)
+                                .on_hover_text(e);
+                        }
+                    }
+                    SelfUpdate::Working(what) => {
+                        ui.spinner();
+                        ui.label(what);
+                    }
+                    SelfUpdate::ReadyToRestart(v) => {
+                        if ui
+                            .button(format!("{}  Restart into v{v}", icon::ARROW_CLOCKWISE))
+                            .clicked()
+                        {
+                            update::restart_into_staged(&self.state);
+                        }
+                    }
+                }
+                if let Some(m) = &update_manifest {
+                    let outdated = clients.iter().any(|c| update::available_for(m, c).is_some());
+                    if outdated
+                        && ui
+                            .button(format!("{}  Update fleet (v{})", icon::UPLOAD_SIMPLE, m.version))
+                            .on_hover_text("Stage the new client binary on every out-of-date client")
+                            .clicked()
+                    {
+                        update::update_fleet(&self.state);
+                    }
+                    let staged = clients
+                        .iter()
+                        .filter(|c| matches!(c.update, ClientUpdate::Staged(_)))
+                        .count();
+                    if staged > 0
+                        && ui
+                            .button(format!("{}  Apply fleet ({staged} staged)", icon::CHECK_FAT))
+                            .on_hover_text("Restart every staged client into the new version (idle clients only)")
+                            .clicked()
+                    {
+                        update::apply_fleet(&self.state);
+                    }
+                }
             });
         });
 
@@ -474,6 +544,63 @@ impl eframe::App for ControllerApp {
                         c.offset_ms.map(|v| format!("{v} ms")).unwrap_or_else(|| "—".into()),
                         c.last_drift_ms.map(|v| format!("{v} ms")).unwrap_or_else(|| "—".into()),
                     ));
+                    {
+                        let version = if c.app_version.is_empty() { "?" } else { &c.app_version };
+                        ui.label(format!("version: {version}"))
+                            .on_hover_text(if c.target_triple.is_empty() {
+                                "platform unknown (pre-update client)".to_string()
+                            } else {
+                                c.target_triple.clone()
+                            });
+                        let available = update_manifest
+                            .as_ref()
+                            .and_then(|m| update::available_for(m, c).map(|_| m.version.clone()));
+                        match (&c.update, available) {
+                            (ClientUpdate::Pushing, _) => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("sending update…");
+                                });
+                            }
+                            (ClientUpdate::Applying, _) => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("restarting into new version…");
+                                });
+                            }
+                            (ClientUpdate::Staged(v), _) => {
+                                if ui
+                                    .button(format!("{}  Apply v{v} (restart)", icon::CHECK_FAT))
+                                    .on_hover_text("Client refuses unless idle")
+                                    .clicked()
+                                {
+                                    update::send_apply(&self.state, &c.client_id);
+                                }
+                            }
+                            (ClientUpdate::Failed(e), available) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 70, 70),
+                                    format!("{} update failed", icon::WARNING),
+                                )
+                                .on_hover_text(e);
+                                if let Some(v) = available {
+                                    if ui.button(format!("{}  Retry update to v{v}", icon::UPLOAD_SIMPLE)).clicked() {
+                                        update::push_update_to(&self.state, c.client_id.clone());
+                                    }
+                                }
+                            }
+                            (ClientUpdate::None, Some(v)) => {
+                                if ui
+                                    .button(format!("{}  Update to v{v}", icon::UPLOAD_SIMPLE))
+                                    .on_hover_text("Stage the new binary on this client; apply separately")
+                                    .clicked()
+                                {
+                                    update::push_update_to(&self.state, c.client_id.clone());
+                                }
+                            }
+                            (ClientUpdate::None, None) => {}
+                        }
+                    }
                     if !c.preflight.is_empty() {
                         let ok = c
                             .preflight

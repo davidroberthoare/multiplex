@@ -14,3 +14,10 @@ pub mod pipeline;
 pub use pipeline::{Canvas, MediaEngine, MediaError, MediaEvent, MediaKind};
 
 pub use cuemesh2_shared::protocol::Layer;
+
+/// The GStreamer runtime's (major, minor) version. Used by the auto-updater
+/// to refuse a client binary that needs a newer runtime than is installed.
+pub fn gstreamer_runtime_version() -> (u32, u32) {
+    let (major, minor, _micro, _nano) = gstreamer::version();
+    (major, minor)
+}

@@ -8,3 +8,4 @@ pub mod logging;
 pub mod protocol;
 pub mod show;
 pub mod transfer;
+pub mod update;

@@ -95,6 +95,14 @@ pub enum ControllerMsg {
     MediaPushBegin(MediaPushBegin),
     /// All chunks for this transfer have been sent.
     MediaPushEnd(MediaPushEnd),
+    /// Announce an incoming client-binary update; binary chunks follow.
+    /// The client stages and verifies but does not apply.
+    UpdatePushBegin(UpdatePushBegin),
+    /// All chunks for this update transfer have been sent.
+    UpdatePushEnd(UpdatePushEnd),
+    /// Operator-confirmed apply of a previously staged update. The client
+    /// swaps its binary and re-execs only if idle; otherwise it refuses.
+    ApplyUpdate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +214,38 @@ pub struct MediaPushEnd {
     pub transfer_id: u64,
 }
 
+/// Header for a controller→client binary update transfer.
+///
+/// The chunks that follow reuse the media-push binary framing
+/// ([`crate::transfer`]); only the destination and verification differ: the
+/// client writes to a staging path next to its own executable and checks the
+/// ed25519 `signature_b64` against the release public key baked into the
+/// binary, on top of the usual size + SHA-256 check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePushBegin {
+    /// Correlates the binary chunks and the END/RESULT messages.
+    pub transfer_id: u64,
+    /// Target triple this binary was built for; the client refuses a
+    /// mismatch with its own compile-time triple.
+    pub target_triple: String,
+    /// Semver of the pushed binary; the client refuses downgrades.
+    pub version: String,
+    pub size: u64,
+    pub sha256_hex: String,
+    /// ed25519 signature over the binary bytes, base64 (standard alphabet).
+    pub signature_b64: String,
+    /// Minimum GStreamer runtime ("major.minor") the pushed binary needs;
+    /// the client refuses when its installed runtime is older, since the
+    /// updater swaps only the CueMesh binary, never the bundled runtime.
+    #[serde(default)]
+    pub min_gstreamer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePushEnd {
+    pub transfer_id: u64,
+}
+
 /// Controller-driven NTP-style sync ping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncPing {
@@ -241,6 +281,10 @@ pub enum ClientMsg {
     MediaPushProgress(MediaPushProgress),
     /// Final verdict on a MEDIA_PUSH after hash verification.
     MediaPushResult(MediaPushResult),
+    /// Final verdict on an UPDATE_PUSH: staged + verified, or why not.
+    UpdatePushResult(UpdatePushResult),
+    /// Outcome of an APPLY_UPDATE (refused when not idle).
+    UpdateApplyResult(UpdateApplyResult),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +292,14 @@ pub struct Hello {
     pub client_id: String,
     pub name: String,
     pub protocol_version: u32,
+    /// Client binary semver (`CARGO_PKG_VERSION`). Empty from pre-update
+    /// clients; the controller treats that as "version unknown".
+    #[serde(default)]
+    pub app_version: String,
+    /// Compile-time target triple, so the controller can pick the right
+    /// update artifact. Empty from pre-update clients.
+    #[serde(default)]
+    pub target_triple: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +359,26 @@ pub struct MediaPushResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePushResult {
+    pub transfer_id: u64,
+    /// Version the transfer claimed to carry.
+    pub version: String,
+    /// True when the binary is staged and fully verified (size, SHA-256,
+    /// signature, triple, downgrade guard).
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateApplyResult {
+    /// True when the client is about to swap its binary and re-exec.
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Drift {
     pub drift_ms: i64,
     pub filtered_offset_ms: i64,
@@ -339,7 +411,7 @@ pub struct SyncReply {
 }
 
 /// Current protocol version. Bump when wire format changes in a breaking way.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// TCP port the controller listens on.
 pub const DEFAULT_PORT: u16 = 9420;
@@ -605,11 +677,87 @@ mod tests {
                 client_id: "abc".into(),
                 name: "Stage Left".into(),
                 protocol_version: PROTOCOL_VERSION,
+                app_version: "0.1.0".into(),
+                target_triple: "x86_64-unknown-linux-gnu".into(),
             }),
         );
         let json = serde_json::to_string(&env).unwrap();
         let back: Envelope<ClientMsg> = serde_json::from_str(&json).unwrap();
         assert!(matches!(back.msg, ClientMsg::Hello(_)));
+    }
+
+    #[test]
+    fn hello_without_version_fields_still_parses() {
+        // A v2 client's HELLO has no app_version/target_triple.
+        let json = r#"{"ts_utc_ms":1,"type":"HELLO","payload":{"client_id":"a","name":"n","protocol_version":2}}"#;
+        let back: Envelope<ClientMsg> = serde_json::from_str(json).unwrap();
+        match back.msg {
+            ClientMsg::Hello(h) => {
+                assert!(h.app_version.is_empty());
+                assert!(h.target_triple.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn update_push_messages_roundtrip() {
+        let begin = Envelope::new(
+            1,
+            ControllerMsg::UpdatePushBegin(UpdatePushBegin {
+                transfer_id: 9,
+                target_triple: "aarch64-unknown-linux-gnu".into(),
+                version: "0.2.0".into(),
+                size: 4096,
+                sha256_hex: "ab".into(),
+                signature_b64: "c2ln".into(),
+                min_gstreamer: None,
+            }),
+        );
+        let json = serde_json::to_string(&begin).unwrap();
+        assert!(json.contains(r#""type":"UPDATE_PUSH_BEGIN""#));
+        let back: Envelope<ControllerMsg> = serde_json::from_str(&json).unwrap();
+        match back.msg {
+            ControllerMsg::UpdatePushBegin(b) => {
+                assert_eq!(b.transfer_id, 9);
+                assert_eq!(b.version, "0.2.0");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let apply = Envelope::new(2, ControllerMsg::ApplyUpdate);
+        let json = serde_json::to_string(&apply).unwrap();
+        assert_eq!(json, r#"{"ts_utc_ms":2,"type":"APPLY_UPDATE"}"#);
+
+        let result = Envelope::new(
+            3,
+            ClientMsg::UpdatePushResult(UpdatePushResult {
+                transfer_id: 9,
+                version: "0.2.0".into(),
+                ok: false,
+                error: Some("signature verification failed".into()),
+            }),
+        );
+        let json = serde_json::to_string(&result).unwrap();
+        let back: Envelope<ClientMsg> = serde_json::from_str(&json).unwrap();
+        match back.msg {
+            ClientMsg::UpdatePushResult(r) => {
+                assert!(!r.ok);
+                assert!(r.error.unwrap().contains("signature"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let applied = Envelope::new(
+            4,
+            ClientMsg::UpdateApplyResult(UpdateApplyResult {
+                ok: false,
+                error: Some("busy — not idle".into()),
+            }),
+        );
+        let json = serde_json::to_string(&applied).unwrap();
+        let back: Envelope<ClientMsg> = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.msg, ClientMsg::UpdateApplyResult(r) if !r.ok));
     }
 
     #[test]

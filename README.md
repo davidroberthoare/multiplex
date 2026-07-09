@@ -123,6 +123,27 @@ Binaries end up in `target/release/`:
 
 ---
 
+## Updating
+
+Updates are **operator-triggered from the controller** — nothing updates
+itself behind your back, and clients never need internet:
+
+1. **Update controller** (toolbar): when the controller machine has internet,
+   it downloads the latest signed release, verifies it, and asks you to
+   confirm the restart. It also caches the client binaries for every platform
+   into an `updates/` folder next to the controller, so step 2 works with no
+   internet at all. (No internet ever? Copy an `updates/` bundle in by hand.)
+2. **Update fleet** (toolbar, or per-client in the roster): sends the right
+   binary to each out-of-date client over the LAN. Clients verify the
+   cryptographic signature and *stage* the update — playback is never
+   touched. You then click **Apply** (per client or fleet-wide) when nothing
+   is on stage; a client that is playing politely refuses.
+
+The updater only swaps the CueMesh binaries. On Windows/macOS, a release that
+needs a newer bundled GStreamer runtime will tell you to reinstall instead.
+
+---
+
 ## A note on media formats
 
 **Recommended: H.264 video in an MP4 container, 30fps.** Hardware decoding works on

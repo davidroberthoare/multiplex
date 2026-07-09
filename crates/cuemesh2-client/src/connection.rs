@@ -22,7 +22,7 @@ use cuemesh2_shared::clock_sync::{correction_for, Correction, CorrectionParams, 
 use cuemesh2_shared::protocol::{
     ClientMsg, ControllerMsg, Envelope, Hello, Layer as WireLayer, LoadCue, MediaFileStatus,
     MediaPushProgress, MediaPushResult, MediaReport, MediaReportEntry, Ready, Status, SyncReply,
-    PROTOCOL_VERSION,
+    UpdateApplyResult, UpdatePushResult, PROTOCOL_VERSION,
 };
 use cuemesh2_shared::show::{
     parse_hex_color, CueKind, DropoutPolicy, EndAction, Poster, DEFAULT_FADE_MS,
@@ -30,6 +30,7 @@ use cuemesh2_shared::show::{
 use cuemesh2_shared::{hashing, transfer};
 
 use crate::state::{PlaybackState, SharedState};
+use crate::update;
 
 /// Keep drift hard-seeks this far from a clip's end so we always land on real
 /// media rather than triggering EOS.
@@ -134,13 +135,21 @@ fn apply_dropout_policy(state: &SharedState, engine: &MediaEngine) {
     }
 }
 
+/// Where a finished transfer's bytes end up, and how they're verified.
+enum TransferDest {
+    /// A media file, moved under the media root after a SHA-256 check.
+    Media { rel_path: PathBuf, sha256_hex: String },
+    /// A client-binary update, staged next to the executable after SHA-256
+    /// plus release-signature verification. Never applied here.
+    Update { meta: update::StagedMeta },
+}
+
 /// An in-flight controller→client file transfer.
 struct IncomingTransfer {
-    rel_path: PathBuf,
+    dest: TransferDest,
     tmp_path: PathBuf,
     file: std::fs::File,
     expected_size: u64,
-    expected_sha256_hex: String,
     received: u64,
     last_progress_sent: u64,
 }
@@ -168,6 +177,8 @@ async fn connect_once(
             client_id: cfg.client_id.clone(),
             name: cfg.name.clone(),
             protocol_version: PROTOCOL_VERSION,
+            app_version: update::APP_VERSION.into(),
+            target_triple: update::TARGET_TRIPLE.into(),
         }),
     );
     sink.send(WsMsg::Text(serde_json::to_string(&hello)?)).await?;
@@ -748,6 +759,70 @@ async fn handle_controller_msg(
         ControllerMsg::MediaPushEnd(end) => {
             finish_transfer(cfg, state, outbound, transfers, end.transfer_id).await;
         }
+        ControllerMsg::UpdatePushBegin(begin) => {
+            let gst = cuemesh2_media::gstreamer_runtime_version();
+            if let Err(e) = begin_update_transfer(transfers, &begin, gst).await {
+                log(state, format!("update push v{} rejected: {e:#}", begin.version));
+                let _ = outbound.try_send(ClientMsg::UpdatePushResult(UpdatePushResult {
+                    transfer_id: begin.transfer_id,
+                    version: begin.version,
+                    ok: false,
+                    error: Some(format!("{e:#}")),
+                }));
+            } else {
+                log(
+                    state,
+                    format!("receiving update v{} ({} bytes)", begin.version, begin.size),
+                );
+            }
+        }
+        ControllerMsg::UpdatePushEnd(end) => {
+            finish_transfer(cfg, state, outbound, transfers, end.transfer_id).await;
+        }
+        ControllerMsg::ApplyUpdate => {
+            apply_update(state, outbound).await;
+        }
+    }
+}
+
+/// Operator-confirmed apply: refuse unless nothing is (or is about to be) on
+/// air, re-verify the staged binary, then self-replace and re-exec.
+async fn apply_update(state: &SharedState, outbound: &mpsc::Sender<ClientMsg>) {
+    let pb_state = state.lock().unwrap().playback.state;
+    let idle = matches!(
+        pb_state,
+        PlaybackState::Idle | PlaybackState::Black | PlaybackState::Error
+    );
+    let refuse = |why: String| {
+        log(state, format!("apply update refused: {why}"));
+        let _ = outbound.try_send(ClientMsg::UpdateApplyResult(UpdateApplyResult {
+            ok: false,
+            error: Some(why),
+        }));
+    };
+    if !idle {
+        return refuse(format!("busy — client is {pb_state:?}"));
+    }
+    let staged = match update::take_staged() {
+        Ok(Some(bin)) => bin,
+        Ok(None) => return refuse("no update staged".into()),
+        Err(e) => return refuse(format!("staged update invalid: {e:#}")),
+    };
+    log(state, "applying staged update — restarting");
+    let _ = outbound.try_send(ClientMsg::UpdateApplyResult(UpdateApplyResult {
+        ok: true,
+        error: None,
+    }));
+    // Give the writer task a moment to flush the result before this process
+    // image disappears; the controller also learns the outcome from the
+    // reconnect HELLO either way.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if let Err(e) = update::apply_and_restart(&staged) {
+        log(state, format!("update apply failed: {e:#}"));
+        let _ = outbound.try_send(ClientMsg::UpdateApplyResult(UpdateApplyResult {
+            ok: false,
+            error: Some(format!("{e:#}")),
+        }));
     }
 }
 
@@ -799,11 +874,47 @@ async fn begin_transfer(
     transfers.lock().await.insert(
         begin.transfer_id,
         IncomingTransfer {
-            rel_path: begin.rel_path.clone(),
+            dest: TransferDest::Media {
+                rel_path: begin.rel_path.clone(),
+                sha256_hex: begin.sha256_hex.clone(),
+            },
             tmp_path,
             file,
             expected_size: begin.size,
-            expected_sha256_hex: begin.sha256_hex.clone(),
+            received: 0,
+            last_progress_sent: 0,
+        },
+    );
+    Ok(())
+}
+
+/// Accept an incoming binary-update transfer. Prechecks (platform, version,
+/// GStreamer floor) run here so a doomed push fails before any bytes move.
+/// The download lands next to the executable so the later rename into the
+/// staged slot stays on one filesystem.
+async fn begin_update_transfer(
+    transfers: &Transfers,
+    begin: &cuemesh2_shared::protocol::UpdatePushBegin,
+    gst_runtime: (u32, u32),
+) -> Result<()> {
+    update::precheck(begin, gst_runtime)?;
+    let staged = update::staged_bin_path()?;
+    let tmp_path = staged.with_file_name(format!(".cuemesh-update-{}", begin.transfer_id));
+    let file = std::fs::File::create(&tmp_path)?;
+    transfers.lock().await.insert(
+        begin.transfer_id,
+        IncomingTransfer {
+            dest: TransferDest::Update {
+                meta: update::StagedMeta {
+                    version: begin.version.clone(),
+                    size: begin.size,
+                    sha256_hex: begin.sha256_hex.clone(),
+                    signature_b64: begin.signature_b64.clone(),
+                },
+            },
+            tmp_path,
+            file,
+            expected_size: begin.size,
             received: 0,
             last_progress_sent: 0,
         },
@@ -832,7 +943,10 @@ async fn handle_chunk(
     }
     t.received += data.len() as u64;
     // Progress roughly every 4 MiB — enough for a UI bar, cheap on the wire.
-    if t.received - t.last_progress_sent >= 4 * 1024 * 1024 || t.received == t.expected_size {
+    // Update pushes skip it: binaries are small and get a single verdict.
+    if matches!(t.dest, TransferDest::Media { .. })
+        && (t.received - t.last_progress_sent >= 4 * 1024 * 1024 || t.received == t.expected_size)
+    {
         t.last_progress_sent = t.received;
         let _ = outbound.try_send(ClientMsg::MediaPushProgress(MediaPushProgress {
             transfer_id: id,
@@ -849,62 +963,142 @@ async fn finish_transfer(
     transfers: &Transfers,
     transfer_id: u64,
 ) {
-    let Some(mut t) = transfers.lock().await.remove(&transfer_id) else {
+    let Some(t) = transfers.lock().await.remove(&transfer_id) else {
         log(state, format!("END for unknown transfer {transfer_id}"));
         return;
     };
-    let result = tokio::task::spawn_blocking(move || -> Result<(PathBuf, PathBuf)> {
-        t.file.flush()?;
-        drop(t.file);
-        if t.received != t.expected_size {
-            let _ = std::fs::remove_file(&t.tmp_path);
-            anyhow::bail!("size mismatch: got {} want {}", t.received, t.expected_size);
-        }
-        let sha_hex = hashing::to_hex(&hashing::sha256_file(&t.tmp_path)?);
-        if sha_hex != t.expected_sha256_hex {
-            let _ = std::fs::remove_file(&t.tmp_path);
-            anyhow::bail!("sha256 mismatch after transfer");
-        }
-        Ok((t.tmp_path, t.rel_path))
-    })
-    .await;
-
+    let media_root = cfg.media_root.clone();
+    let result = tokio::task::spawn_blocking(move || complete_transfer(t, &media_root)).await;
     // Unpack the nested Result (join error vs. verify error).
-    let verified: Result<(PathBuf, PathBuf)> = match result {
+    let outcome = match result {
         Ok(inner) => inner,
-        Err(e) => Err(anyhow::anyhow!("verify task panicked: {e}")),
+        Err(e) => Err((None, anyhow::anyhow!("verify task panicked: {e}"))),
     };
 
-    let (ok, rel_path, error) = match verified {
-        Ok((tmp, rel)) => {
-            let final_path = cfg.media_root.join(&rel);
+    let msg = match outcome {
+        Ok(TransferDone::Media { rel_path }) => {
+            log(state, format!("media received: {}", rel_path.display()));
+            ClientMsg::MediaPushResult(MediaPushResult {
+                transfer_id,
+                rel_path,
+                ok: true,
+                error: None,
+            })
+        }
+        Ok(TransferDone::Update { version }) => {
+            log(state, format!("update v{version} staged and verified — awaiting apply"));
+            ClientMsg::UpdatePushResult(UpdatePushResult {
+                transfer_id,
+                version,
+                ok: true,
+                error: None,
+            })
+        }
+        Err((dest, e)) => {
+            let error = format!("{e:#}");
+            log(state, format!("push failed: {error}"));
+            match dest {
+                Some(TransferDest::Update { meta }) => {
+                    ClientMsg::UpdatePushResult(UpdatePushResult {
+                        transfer_id,
+                        version: meta.version,
+                        ok: false,
+                        error: Some(error),
+                    })
+                }
+                Some(TransferDest::Media { rel_path, .. }) => {
+                    ClientMsg::MediaPushResult(MediaPushResult {
+                        transfer_id,
+                        rel_path,
+                        ok: false,
+                        error: Some(error),
+                    })
+                }
+                None => ClientMsg::MediaPushResult(MediaPushResult {
+                    transfer_id,
+                    rel_path: PathBuf::new(),
+                    ok: false,
+                    error: Some(error),
+                }),
+            }
+        }
+    };
+    let _ = outbound.try_send(msg);
+}
+
+enum TransferDone {
+    Media { rel_path: PathBuf },
+    Update { version: String },
+}
+
+/// Flush, verify, and move a finished download to its destination.
+/// Blocking (hashing + rename); run on the blocking pool. Returns the
+/// destination alongside errors so the caller can report on the right
+/// channel.
+fn complete_transfer(
+    mut t: IncomingTransfer,
+    media_root: &Path,
+) -> std::result::Result<TransferDone, (Option<TransferDest>, anyhow::Error)> {
+    let cleanup_tmp = |tmp: &Path| {
+        let _ = std::fs::remove_file(tmp);
+    };
+    if let Err(e) = t.file.flush() {
+        cleanup_tmp(&t.tmp_path);
+        return Err((Some(t.dest), e.into()));
+    }
+    drop(t.file);
+    if t.received != t.expected_size {
+        cleanup_tmp(&t.tmp_path);
+        return Err((
+            Some(t.dest),
+            anyhow::anyhow!("size mismatch: got {} want {}", t.received, t.expected_size),
+        ));
+    }
+    match t.dest {
+        TransferDest::Media { rel_path, sha256_hex } => {
+            let sha = match hashing::sha256_file(&t.tmp_path) {
+                Ok(h) => hashing::to_hex(&h),
+                Err(e) => {
+                    cleanup_tmp(&t.tmp_path);
+                    return Err((Some(TransferDest::Media { rel_path, sha256_hex }), e.into()));
+                }
+            };
+            if sha != sha256_hex {
+                cleanup_tmp(&t.tmp_path);
+                return Err((
+                    Some(TransferDest::Media { rel_path, sha256_hex }),
+                    anyhow::anyhow!("sha256 mismatch after transfer"),
+                ));
+            }
+            let final_path = media_root.join(&rel_path);
             let moved = final_path
                 .parent()
                 .map(std::fs::create_dir_all)
                 .transpose()
-                .and_then(|_| std::fs::rename(&tmp, &final_path).map(Some));
+                .and_then(|_| std::fs::rename(&t.tmp_path, &final_path));
             match moved {
-                Ok(_) => {
-                    log(state, format!("media received: {}", rel.display()));
-                    (true, rel, None)
-                }
+                Ok(_) => Ok(TransferDone::Media { rel_path }),
                 Err(e) => {
-                    let _ = std::fs::remove_file(&tmp);
-                    (false, rel, Some(format!("move into place failed: {e}")))
+                    cleanup_tmp(&t.tmp_path);
+                    Err((
+                        Some(TransferDest::Media { rel_path, sha256_hex }),
+                        anyhow::anyhow!("move into place failed: {e}"),
+                    ))
                 }
             }
         }
-        Err(e) => (false, PathBuf::new(), Some(e.to_string())),
-    };
-    if let Some(err) = &error {
-        log(state, format!("media push failed: {err}"));
+        TransferDest::Update { meta } => {
+            // stage() re-verifies size, SHA-256, and the release signature.
+            match update::stage(&t.tmp_path, &meta) {
+                Ok(()) => Ok(TransferDone::Update { version: meta.version }),
+                Err(e) => {
+                    cleanup_tmp(&t.tmp_path);
+                    update::discard_staged();
+                    Err((Some(TransferDest::Update { meta }), e))
+                }
+            }
+        }
     }
-    let _ = outbound.try_send(ClientMsg::MediaPushResult(MediaPushResult {
-        transfer_id,
-        rel_path,
-        ok,
-        error,
-    }));
 }
 
 /// (Re)load or clear the show's idle poster on the engine's background layer,

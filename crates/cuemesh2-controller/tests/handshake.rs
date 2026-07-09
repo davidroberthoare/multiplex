@@ -71,6 +71,8 @@ async fn hello_gets_ack_show_sync_and_roster_entry() {
             client_id: "test-client-1".into(),
             name: "Test Client".into(),
             protocol_version: PROTOCOL_VERSION,
+            app_version: "0.1.0".into(),
+            target_triple: "x86_64-unknown-linux-gnu".into(),
         }),
     );
     ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap()))
@@ -205,6 +207,8 @@ async fn blacklisted_client_is_rejected() {
             client_id: "bad-client".into(),
             name: "Banned".into(),
             protocol_version: PROTOCOL_VERSION,
+            app_version: "0.1.0".into(),
+            target_triple: "x86_64-unknown-linux-gnu".into(),
         }),
     );
     ws.send(WsMsg::Text(serde_json::to_string(&hello).unwrap()))

@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 use cuemesh2_shared::protocol::{ClientState, ControllerMsg, Layer, MediaFileSpec, MediaFileStatus};
 use cuemesh2_shared::show::ShowFile;
+use cuemesh2_shared::update::UpdateManifest;
 
 /// What the per-client writer task can send: JSON envelopes or raw binary
 /// media chunks (already framed by `cuemesh2_shared::transfer`).
@@ -17,12 +18,34 @@ pub enum Outgoing {
     Chunk(Vec<u8>),
 }
 
+/// Where one client stands in the update lifecycle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ClientUpdate {
+    /// Nothing pushed/staged (an update may still be *available* — that is
+    /// derived from versions, not stored).
+    #[default]
+    None,
+    /// Binary is streaming to the client.
+    Pushing,
+    /// Client verified and staged this version; awaiting operator apply.
+    Staged(String),
+    /// Operator sent APPLY_UPDATE; waiting for the client to restart.
+    Applying,
+    /// Push or apply failed; the client says why.
+    Failed(String),
+}
+
 /// A connected client from the controller's point of view.
 #[derive(Debug, Clone)]
 pub struct ClientRow {
     pub client_id: String,
     pub name: String,
     pub addr: String,
+    /// Client binary semver from HELLO; empty = pre-update client.
+    pub app_version: String,
+    /// Client compile-time target triple from HELLO; empty = unknown.
+    pub target_triple: String,
+    pub update: ClientUpdate,
     pub state: ClientState,
     pub current_cue: Option<String>,
     pub position_ms: u64,
@@ -69,8 +92,27 @@ pub struct AppState {
     pub local_media: Option<Vec<MediaFileSpec>>,
     /// True while the preflight hashing task runs (drives a UI spinner).
     pub preflight_running: bool,
+    /// Manifest of the local update bundle (`updates/` next to the binary),
+    /// if one is present and parses. Drives "update available" in the roster.
+    pub update_manifest: Option<UpdateManifest>,
+    /// Where the controller's own self-update stands (drives the toolbar).
+    pub self_update: SelfUpdate,
     /// Log lines shown in the UI. Bounded — oldest entries drop.
     pub log_lines: Vec<String>,
+}
+
+/// Controller self-update lifecycle (all transitions operator-triggered
+/// except Checking→Downloading→ReadyToRestart within one "check" action).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SelfUpdate {
+    #[default]
+    Idle,
+    /// Fetching the remote manifest / downloading artifacts.
+    Working(String),
+    /// New controller binary verified and staged; client bundle cached.
+    /// Operator confirms the restart.
+    ReadyToRestart(String),
+    Failed(String),
 }
 
 impl AppState {

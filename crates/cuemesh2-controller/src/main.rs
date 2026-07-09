@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 
-use cuemesh2_controller::{discovery, server, state, sync, ui};
+use cuemesh2_controller::{discovery, server, state, sync, ui, update};
 use cuemesh2_shared::protocol::DEFAULT_PORT;
 
 fn main() -> anyhow::Result<()> {
@@ -24,6 +24,9 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)));
 
     let state = state::shared();
+    // Pick up any client-update bundle sitting next to the binary (placed by
+    // a previous self-update, or by hand from a USB stick).
+    update::load_local_manifest(&state);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -306,6 +306,44 @@ Loaded and validated with `serde` + `toml`. Validation: unique cue IDs, file exi
 
 ---
 
+## Auto-Update
+
+Controller-mediated, **operator-triggered** (never automatic), offline-capable.
+Two independent actions in the controller toolbar:
+
+1. **Update controller** — when online, fetches the latest signed release
+   (`CUEMESH_UPDATE_URL`, default the GitHub `releases/latest/download`
+   redirect), verifies everything, stages its own binary (`<exe>.new`), and
+   caches the full per-platform **client bundle** into `updates/` next to the
+   binary (`CUEMESH_UPDATE_BUNDLE` overrides). The operator confirms the
+   restart. Offline theatres skip this and drop a bundle in by hand (USB).
+2. **Update fleet** — streams the right per-triple client binary from the
+   local bundle over the existing WebSocket (same chunk framing as media
+   push: `UPDATE_PUSH_BEGIN` / chunks / `UPDATE_PUSH_END`). The client
+   verifies (size, SHA-256, **ed25519 signature**, target triple, downgrade
+   guard, `min_gstreamer` floor) and **stages** to `<exe>.new` +
+   `<exe>.new.meta`, replying `UPDATE_PUSH_RESULT`. Nothing applies until the
+   operator clicks **Apply** (per client or fleet-wide): `APPLY_UPDATE` is
+   honoured only while idle/black/error — never mid-show — via
+   `self-replace` + re-exec, and refused (`UPDATE_APPLY_RESULT`) otherwise. A
+   valid staged binary also applies at the next clean client startup.
+
+**Bundle contract** (what release CI must produce as flat release assets):
+`manifest.toml` with `version = "X.Y.Z"` plus `[clients.<triple>]` /
+`[controllers.<triple>]` tables (`file`, `sha256`, `signature`, optional
+`min_gstreamer`) — see `cuemesh2_shared::update`. Sign each artifact with
+`cargo run -p cuemesh2-shared --example update_sign` (key in the
+`CUEMESH_SIGNING_KEY` env var / CI secret; generate with the `update_keygen`
+example — the private key is **never** committed and never lives on a
+controller). The verifying public key is baked in
+(`update::DEFAULT_RELEASE_PUBKEY_B64`, overridable at build time via
+`CUEMESH_RELEASE_PUBKEY_B64`); clients report `app_version` + `target_triple`
+in `HELLO`, which drives "update available" in the roster.
+
+Limitations: only the CueMesh binary is swapped — a release needing a newer
+GStreamer runtime is a manual reinstall (that's what `min_gstreamer` guards);
+no delta updates; controller self-update needs internet at that moment.
+
 ## Discovery, Preflight, Diagnostics
 
 - **Discovery** — controller advertises `_cuemesh._tcp.local.` via `mdns-sd`; client browses and offers a manual IP fallback.

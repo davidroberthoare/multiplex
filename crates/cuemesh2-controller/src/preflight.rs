@@ -23,6 +23,12 @@ use crate::util::expand_tilde;
 /// Monotonic transfer ids, unique within this controller process.
 static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Allocate a transfer id (shared with the update pusher so media and update
+/// chunks can never collide on the wire).
+pub fn next_transfer_id() -> u64 {
+    NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Hash every unique file the show references. Returns the specs for files
 /// that exist locally plus the rel paths that are missing on the controller
 /// itself (those can't be checked or pushed and deserve a loud log line).
@@ -118,7 +124,7 @@ pub fn push_missing_to(state: &SharedState, client_id: String) {
             return;
         }
         for spec in to_send {
-            let transfer_id = NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
+            let transfer_id = next_transfer_id();
             {
                 let mut s = state.lock().unwrap();
                 if let Some(row) = s.clients.get_mut(&client_id) {

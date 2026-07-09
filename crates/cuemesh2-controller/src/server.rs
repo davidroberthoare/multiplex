@@ -131,6 +131,9 @@ async fn handle_conn(stream: TcpStream, addr: SocketAddr, state: SharedState) ->
                 client_id: client_id.clone(),
                 name: hello.name.clone(),
                 addr: addr.to_string(),
+                app_version: hello.app_version.clone(),
+                target_triple: hello.target_triple.clone(),
+                update: Default::default(),
                 state: ClientState::Idle,
                 current_cue: None,
                 position_ms: 0,
@@ -142,7 +145,11 @@ async fn handle_conn(stream: TcpStream, addr: SocketAddr, state: SharedState) ->
                 outbound: out_tx.clone(),
             },
         );
-        s.push_log(format!("client {} ({}) joined from {addr}", hello.name, client_id));
+        let version = if hello.app_version.is_empty() { "?" } else { &hello.app_version };
+        s.push_log(format!(
+            "client {} ({}) v{version} joined from {addr}",
+            hello.name, client_id
+        ));
     }
 
     // Send HELLO_ACK directly, then the current show (if loaded) via the queue.
@@ -305,6 +312,42 @@ fn handle_client_msg(state: &SharedState, client_id: &str, env: Envelope<ClientM
                 format!("FAILED: {}", r.error.unwrap_or_default())
             };
             st.push_log(format!("push {} → {client_id}: {verdict}", r.rel_path.display()));
+        }
+        ClientMsg::UpdatePushResult(r) => {
+            let mut st = state.lock().unwrap();
+            if let Some(row) = st.clients.get_mut(client_id) {
+                row.update = if r.ok {
+                    crate::state::ClientUpdate::Staged(r.version.clone())
+                } else {
+                    crate::state::ClientUpdate::Failed(r.error.clone().unwrap_or_default())
+                };
+            }
+            let verdict = if r.ok {
+                "staged".to_string()
+            } else {
+                format!("FAILED: {}", r.error.unwrap_or_default())
+            };
+            st.push_log(format!("update v{} → {client_id}: {verdict}", r.version));
+        }
+        ClientMsg::UpdateApplyResult(r) => {
+            let mut st = state.lock().unwrap();
+            if let Some(row) = st.clients.get_mut(client_id) {
+                if r.ok {
+                    // Row disappears on disconnect and reappears with the new
+                    // version's HELLO; Applying covers the gap.
+                    row.update = crate::state::ClientUpdate::Applying;
+                } else {
+                    row.update = crate::state::ClientUpdate::Failed(
+                        r.error.clone().unwrap_or_default(),
+                    );
+                }
+            }
+            let verdict = if r.ok {
+                "restarting".to_string()
+            } else {
+                format!("refused: {}", r.error.unwrap_or_default())
+            };
+            st.push_log(format!("apply update → {client_id}: {verdict}"));
         }
         ClientMsg::Log(l) => {
             state.lock().unwrap().push_log(format!(

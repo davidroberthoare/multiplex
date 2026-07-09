@@ -21,6 +21,14 @@ pub fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+/// Hash an in-memory buffer (update artifacts are read whole for signing
+/// and signature verification anyway).
+pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
 /// Lowercase hex string, useful for logs and JSON payloads.
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
