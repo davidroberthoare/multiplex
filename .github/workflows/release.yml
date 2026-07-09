@@ -11,6 +11,8 @@ env:
 
 jobs:
   build:
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -53,14 +55,27 @@ jobs:
         shell: pwsh
         run: |
           $msi = "gstreamer-1.0-devel-msvc-x86_64-${{ env.GST_VERSION }}.msi"
-          Invoke-WebRequest -Uri "https://gstreamer.freedesktop.org/data/pkg/windows/${{ env.GST_VERSION }}/msvc/$msi" -OutFile $msi
-          Start-Process msiexec.exe -Wait -ArgumentList "/i $msi /qn"
-          echo "C:\gstreamer\1.0\msvc_x86_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $url = "https://gstreamer.freedesktop.org/data/pkg/windows/${{ env.GST_VERSION }}/msvc/$msi"
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          # Administrative install — extracts without actually "installing"
+          $extractDir = "C:\gstreamer\1.0\msvc_x86_64"
+          Start-Process msiexec.exe -Wait -NoNewWindow -ArgumentList "/a", "`"$(Resolve-Path $msi)`"", "/qn", "TARGETDIR=`"${extractDir}`""
+          # Add bin to PATH
+          echo "${extractDir}\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=${extractDir}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # GStreamer has a bundled pkg-config; add it to PATH
+          echo "${extractDir}\bin\pkg-config" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # Set PKG_CONFIG_PATH so glib-sys can find .pc files
+          echo "PKG_CONFIG_PATH=${extractDir}\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install GStreamer (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly
+          curl -fsSL "https://gstreamer.freedesktop.org/data/pkg/osx/${{ env.GST_VERSION }}/gstreamer-1.0-devel-${{ env.GST_VERSION }}-universal.pkg" -o /tmp/gst-dev.pkg
+          sudo installer -pkg /tmp/gst-dev.pkg -target /
+          # Also install the runtime .pkg (needed for dylib bundling)
+          curl -fsSL "https://gstreamer.freedesktop.org/data/pkg/osx/${{ env.GST_VERSION }}/gstreamer-1.0-${{ env.GST_VERSION }}-universal.pkg" -o /tmp/gst-runtime.pkg
+          sudo installer -pkg /tmp/gst-runtime.pkg -target /
           brew install dylibbundler
 
       # ── Build ──
@@ -72,6 +87,8 @@ jobs:
       - name: Build release (macOS universal)
         if: runner.os == 'macOS'
         run: |
+          # Set up pkg-config path for the universal framework
+          export PKG_CONFIG_PATH="/Library/Frameworks/GStreamer.framework/Versions/Current/lib/pkgconfig${PKG_CONFIG_PATH:+:}${PKG_CONFIG_PATH}"
           rustup target add x86_64-apple-darwin
           cargo build --release --target aarch64-apple-darwin
           cargo build --release --target x86_64-apple-darwin

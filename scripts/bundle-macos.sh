@@ -29,17 +29,12 @@ dylibbundler -od -b -x "$BINDIR/cuemesh2-client" \
   -d "$LIBDIR" -p @executable_path/../lib/
 
 echo "==> Copying GStreamer plugins ..."
-GST_PLUGIN_DIR=$(pkg-config --variable=pluginsdir gstreamer-1.0 2>/dev/null \
-  || brew --prefix gstreamer 2>/dev/null)/lib/gstreamer-1.0
-if [ -z "${GST_PLUGIN_DIR}" ]; then
-  # Fallback: find it manually
-  GST_PLUGIN_DIR=$(find /opt/homebrew /usr/local -name "gstreamer-1.0" -type d 2>/dev/null \
-    | head -1)
-fi
-if [ -n "$GST_PLUGIN_DIR" ] && [ -d "$GST_PLUGIN_DIR" ]; then
+GST_FRAMEWORK="/Library/Frameworks/GStreamer.framework/Versions/Current"
+GST_PLUGIN_DIR="${GST_FRAMEWORK}/lib/gstreamer-1.0"
+if [ -d "$GST_PLUGIN_DIR" ]; then
   cp -a "$GST_PLUGIN_DIR"/. "$PLUGDIR/"
 else
-  echo "WARNING: could not find GStreamer plugin directory. Plugins not bundled."
+  echo "WARNING: could not find GStreamer plugin directory at ${GST_PLUGIN_DIR}. Plugins not bundled."
 fi
 
 echo "==> Creating launcher scripts ..."
