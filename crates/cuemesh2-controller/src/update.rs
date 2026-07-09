@@ -39,8 +39,9 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// redirect serves flat asset names, which is why manifest `file` fields are
 /// flat. Override with `CUEMESH_UPDATE_URL` (e.g. an intranet mirror).
 fn release_base_url() -> String {
-    std::env::var("CUEMESH_UPDATE_URL")
-        .unwrap_or_else(|_| "https://github.com/drhmedia/cuemesh2/releases/latest/download".into())
+    std::env::var("CUEMESH_UPDATE_URL").unwrap_or_else(|_| {
+        "https://github.com/davidroberthoare/CueMesh2/releases/latest/download".into()
+    })
 }
 
 /// The local update bundle: `updates/` next to the controller binary, or

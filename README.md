@@ -111,8 +111,8 @@ See `examples/example_show.cuemesh.toml` for a real example.
 ## Building from source
 
 ```sh
-git clone https://github.com/drhmedia/cuemesh2
-cd cuemesh2
+git clone https://github.com/davidroberthoare/CueMesh2
+cd CueMesh2
 cargo build --release
 ```
 
