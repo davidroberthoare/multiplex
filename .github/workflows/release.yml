@@ -153,9 +153,92 @@ jobs:
         run: |
           scripts/bundle-macos.sh "${{ github.ref_name }}"
 
+      # ── Signed update-bundle artifacts (consumed by the auto-updater) ──
+      #
+      # Each job renames its binaries to flat per-triple asset names, signs
+      # them with the release key (see CLAUDE.md "Auto-Update" and
+      # crates/cuemesh2-shared/examples/update_sign.rs), and emits the
+      # manifest fragments. A follow-up job assembles manifest.toml and
+      # uploads everything to the release.
+
+      - name: Sign update artifacts
+        shell: bash
+        env:
+          CUEMESH_SIGNING_KEY: ${{ secrets.CUEMESH_SIGNING_KEY }}
+        run: |
+          if [ -z "$CUEMESH_SIGNING_KEY" ]; then
+            echo "::error::CUEMESH_SIGNING_KEY secret is not set — cannot sign the update bundle. Run: gh secret set CUEMESH_SIGNING_KEY < ~/.cuemesh2/release_signing.key"
+            exit 1
+          fi
+          mkdir -p update/bin update/fragments
+          frag="update/fragments/${{ matrix.suffix }}.toml"
+          sign() { # <clients|controllers> <triple> <src> <flat-name>
+            cp "$3" "update/bin/$4"
+            cargo run -q -p cuemesh2-shared --example update_sign -- "$1" "$2" "update/bin/$4" >> "$frag"
+            echo >> "$frag"
+          }
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # One universal binary serves both Apple triples; the manifest
+            # lists it under each so the controller finds it either way.
+            for triple in aarch64-apple-darwin x86_64-apple-darwin; do
+              sign clients     "$triple" target/release/cuemesh2-client     cuemesh2-client-macos-universal
+              sign controllers "$triple" target/release/cuemesh2-controller cuemesh2-controller-macos-universal
+            done
+            # sign() copies the same file repeatedly — harmless.
+          else
+            EXT=""
+            [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
+            sign clients     "${{ matrix.target }}" "target/release/cuemesh2-client$EXT"     "cuemesh2-client-${{ matrix.target }}$EXT"
+            sign controllers "${{ matrix.target }}" "target/release/cuemesh2-controller$EXT" "cuemesh2-controller-${{ matrix.target }}$EXT"
+          fi
+          cat "$frag"
+
+      - name: Stash update artifacts for the manifest job
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-${{ matrix.suffix }}
+          path: update/
+          if-no-files-found: error
+
       # ── Upload ──
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+
+  # Assemble the signed update bundle from every platform's artifacts and
+  # attach it to the release: manifest.toml + one flat binary per target.
+  update-bundle:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: update-*
+          merge-multiple: true
+          path: bundle
+
+      - name: Assemble manifest.toml
+        run: |
+          # The manifest version is the crates' semver (what clients report
+          # in HELLO), not the git tag.
+          version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          {
+            echo "version = \"$version\""
+            echo
+            cat bundle/fragments/*.toml
+          } > bundle/manifest.toml
+          echo "── manifest.toml ──"
+          cat bundle/manifest.toml
+
+      - name: Upload update bundle to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bundle/manifest.toml
+            bundle/bin/*
