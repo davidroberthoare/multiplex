@@ -331,7 +331,7 @@ Two independent actions in the controller toolbar:
 **Bundle contract** (what release CI must produce as flat release assets):
 `manifest.toml` with `version = "X.Y.Z"` plus `[clients.<triple>]` /
 `[controllers.<triple>]` tables (`file`, `sha256`, `signature`, optional
-`min_gstreamer`) — see `cuemesh2_shared::update`. Sign each artifact with
+`min_gstreamer`) — see `multiplex_shared::update`. Sign each artifact with
 `cargo run -p multiplex-shared --example update_sign` (key in the
 `MULTIPLEX_SIGNING_KEY` env var / CI secret; generate with the `update_keygen`
 example — the private key is **never** committed and never lives on a
@@ -340,7 +340,7 @@ controller). The verifying public key is baked in
 `MULTIPLEX_RELEASE_PUBKEY_B64`); clients report `app_version` + `target_triple`
 in `HELLO`, which drives "update available" in the roster.
 
-Limitations: only the CueMesh binary is swapped — a release needing a newer
+Limitations: only the MultiPlex binary is swapped — a release needing a newer
 GStreamer runtime is a manual reinstall (that's what `min_gstreamer` guards);
 no delta updates; controller self-update needs internet at that moment.
 

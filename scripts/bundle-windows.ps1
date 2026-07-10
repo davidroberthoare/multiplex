@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 <#
 .SYNOPSIS
-  Bundles cuemesh2 binaries with the GStreamer runtime into a portable .zip
+  Bundles multiplex binaries with the GStreamer runtime into a portable .zip
   for Windows. Run after `cargo build --release`.
 .PARAMETER Version
   The release version tag (e.g. "v0.1.0").
@@ -15,7 +15,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$ArchiveName  = "cuemesh2-${Version}-x86_64-windows"
+$ArchiveName  = "multiplex-${Version}-x86_64-windows"
 $StagingDir   = "dist/${ArchiveName}"
 $GstUrlBase   = "https://gstreamer.freedesktop.org/data/pkg/windows/${GstVersion}/msvc"
 $RuntimeMsi   = "gstreamer-1.0-msvc-x86_64-${GstVersion}.msi"
@@ -55,8 +55,8 @@ New-Item -ItemType Directory -Path "${StagingDir}\gstreamer\bin" -Force | Out-Nu
 New-Item -ItemType Directory -Path "${StagingDir}\gstreamer\lib\gstreamer-1.0" -Force | Out-Null
 
 # Copy the binaries
-Copy-Item "target\release\cuemesh2-controller.exe" $StagingDir
-Copy-Item "target\release\cuemesh2-client.exe" $StagingDir
+Copy-Item "target\release\multiplex-controller.exe" $StagingDir
+Copy-Item "target\release\multiplex-client.exe" $StagingDir
 
 # Copy all GStreamer runtime DLLs
 Write-Host "  Copying DLLs from $($gstBin.FullName) ..."
@@ -72,7 +72,7 @@ set "DIR=%~dp0"
 set "GSTREAMER_ROOT=%DIR%gstreamer"
 set "GST_PLUGIN_PATH=%GSTREAMER_ROOT%\lib\gstreamer-1.0"
 set "PATH=%GSTREAMER_ROOT%\bin;%PATH%"
-"%~dp0cuemesh2-controller.exe" %*
+"%~dp0multiplex-controller.exe" %*
 "@ | Out-File -FilePath "${StagingDir}\run-controller.bat" -Encoding ascii
 
 @"
@@ -81,7 +81,7 @@ set "DIR=%~dp0"
 set "GSTREAMER_ROOT=%DIR%gstreamer"
 set "GST_PLUGIN_PATH=%GSTREAMER_ROOT%\lib\gstreamer-1.0"
 set "PATH=%GSTREAMER_ROOT%\bin;%PATH%"
-"%~dp0cuemesh2-client.exe" %*
+"%~dp0multiplex-client.exe" %*
 "@ | Out-File -FilePath "${StagingDir}\run-client.bat" -Encoding ascii
 
 # ── 5. Create .zip ──

@@ -2,5 +2,5 @@
 .claude
 .vscode
 .handoff-*.md
-# Release signing keys — never commit. See crates/cuemesh2-shared/examples/update_keygen.rs
+# Release signing keys — never commit. See crates/multiplex-shared/examples/update_keygen.rs
 /keys/
