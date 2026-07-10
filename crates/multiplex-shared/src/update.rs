@@ -11,7 +11,7 @@
 //! version = "0.2.0"
 //!
 //! [clients.x86_64-unknown-linux-gnu]
-//! file = "multiplex-client-x86_64-unknown-linux-gnu"
+//! file = "multiplex-client-x86_64-linux"
 //! sha256 = "…hex…"
 //! signature = "…base64…"
 //! min_gstreamer = "1.18"   # optional

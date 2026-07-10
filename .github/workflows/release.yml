@@ -187,8 +187,12 @@ jobs:
           else
             EXT=""
             [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
-            sign clients     "${{ matrix.target }}" "target/release/multiplex-client$EXT"     "multiplex-client-${{ matrix.target }}$EXT"
-            sign controllers "${{ matrix.target }}" "target/release/multiplex-controller$EXT" "multiplex-controller-${{ matrix.target }}$EXT"
+            # The manifest's [clients.<triple>] key must stay the real Rust
+            # target triple (matches what clients report in HELLO), but the
+            # flat asset/file name is opaque — use the friendlier suffix
+            # instead of the triple's "unknown" vendor component.
+            sign clients     "${{ matrix.target }}" "target/release/multiplex-client$EXT"     "multiplex-client-${{ matrix.suffix }}$EXT"
+            sign controllers "${{ matrix.target }}" "target/release/multiplex-controller$EXT" "multiplex-controller-${{ matrix.suffix }}$EXT"
           fi
           cat "$frag"
 
