@@ -33,7 +33,7 @@ This is a **fresh project** — not a port of anything. It is inspired by an ear
 | WebSocket | **`tokio-tungstenite`** | Controller ↔ client transport |
 | Service discovery | **`mdns-sd`** | Pure-Rust mDNS/zeroconf, no libdbus needed |
 | Serialization | **`serde` + `serde_json` + `toml`** | JSON on the wire, TOML on disk |
-| Hashing | **`sha2`** | Preflight media verification |
+| Hashing | **`sha2`** | Transfer integrity (media push, binary updates) |
 | UI | **`egui` + `eframe`** | Pure Rust, cross-platform, no system Qt/GTK dep |
 | Logging | **`tracing` + `tracing-subscriber`** | Structured logs, JSONL client-side |
 | Packaging | **`cargo` + platform installers** (`.deb`, `.msi`, `.dmg` where useful) | Simple, boring, works |
@@ -347,7 +347,7 @@ no delta updates; controller self-update needs internet at that moment.
 ## Discovery, Preflight, Diagnostics
 
 - **Discovery** — controller advertises `_multiplex._tcp.local.` via `mdns-sd`; client browses and offers a manual IP fallback.
-- **Preflight** — before running a show, controller collects SHA-256 hashes from each client and reports `ok`/`missing`/`mismatch` per file.
+- **Preflight** — before running a show, controller checks each referenced file's presence and size against every client and reports `ok`/`missing`/`mismatch` per file. Filename + size only, not a content hash — hashing every file on every client doesn't scale with library size. A file that's actually pushed (missing or size-mismatched) still gets a SHA-256 integrity check on the transferred bytes.
 - **Support bundle** — a ZIP of system info, active show, and rotating logs for troubleshooting. Rolled by `tracing-appender`, aggregated on request.
 
 ---

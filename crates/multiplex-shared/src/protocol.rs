@@ -187,12 +187,19 @@ pub struct FadeCmd {
 }
 
 /// One file the controller expects the client to have.
+///
+/// Preflight is a filename + size check, not a content hash: hashing every
+/// media file on every client on every preflight doesn't scale with library
+/// size (large/many videos made this the dominant cost). A file that's
+/// present with the right name and size is treated as ok; genuine content
+/// corruption is still caught where it matters — the SHA-256 check on actual
+/// transferred bytes in [`MediaPushBegin`] / the client's post-transfer
+/// verification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaFileSpec {
     /// Path relative to the media root.
     pub rel_path: PathBuf,
     pub size: u64,
-    pub sha256_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,12 +329,12 @@ pub struct Status {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum MediaFileStatus {
-    /// Present with matching size and hash.
+    /// Present with matching size.
     Ok,
     /// Not present at all.
     Missing,
-    /// Present but different content.
-    Mismatch { size: u64, sha256_hex: String },
+    /// Present but a different size than expected.
+    Mismatch { size: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -593,7 +600,6 @@ mod tests {
                 files: vec![MediaFileSpec {
                     rel_path: PathBuf::from("a.mp4"),
                     size: 100,
-                    sha256_hex: "ab".into(),
                 }],
             }),
         );
@@ -611,10 +617,7 @@ mod tests {
                     },
                     MediaReportEntry {
                         rel_path: PathBuf::from("b.mp4"),
-                        status: MediaFileStatus::Mismatch {
-                            size: 5,
-                            sha256_hex: "cd".into(),
-                        },
+                        status: MediaFileStatus::Mismatch { size: 5 },
                     },
                 ],
             }),

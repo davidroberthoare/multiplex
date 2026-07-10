@@ -87,10 +87,10 @@ A cue's fade and crossfade timings live on the cue itself:
 
 ## 4. Preflight and push media
 
-Before the show, click **Preflight**. The controller hashes every file the
-show needs and asks each client to do the same, then the roster shows, per
-client, how many files are present and flags anything **missing** or
-**mismatched** (present but wrong contents).
+Before the show, click **Preflight**. The controller checks every file the
+show needs (name + size) and asks each client to do the same, then the
+roster shows, per client, how many files are present and flags anything
+**missing** or **mismatched** (present but the wrong size).
 
 For any client with missing/mismatched files, click **Push missing media**.
 The controller streams those files over the same connection; the client

@@ -728,7 +728,7 @@ async fn handle_controller_msg(
                     .iter()
                     .map(|spec| MediaReportEntry {
                         rel_path: spec.rel_path.clone(),
-                        status: check_file(&root, &spec.rel_path, spec.size, &spec.sha256_hex),
+                        status: check_file(&root, &spec.rel_path, spec.size),
                     })
                     .collect();
                 let n_ok = entries.iter().filter(|e| e.status == MediaFileStatus::Ok).count();
@@ -827,21 +827,21 @@ async fn apply_update(state: &SharedState, outbound: &mpsc::Sender<ClientMsg>) {
 }
 
 /// Compare one on-disk file against the controller's expectation.
-fn check_file(root: &Path, rel: &Path, want_size: u64, want_sha_hex: &str) -> MediaFileStatus {
+///
+/// Filename + size only, not a content hash: hashing every media file on
+/// every preflight doesn't scale with library size. A file that's actually
+/// pushed still gets a SHA-256 integrity check after transfer (see
+/// `finish_transfer`), so corruption in transit is still caught.
+fn check_file(root: &Path, rel: &Path, want_size: u64) -> MediaFileStatus {
     let full = root.join(rel);
     let Ok(meta) = std::fs::metadata(&full) else {
         return MediaFileStatus::Missing;
     };
     let size = meta.len();
-    // Hash even when sizes differ so the report carries the actual hash.
-    let sha_hex = match hashing::sha256_file(&full) {
-        Ok(h) => hashing::to_hex(&h),
-        Err(_) => return MediaFileStatus::Missing,
-    };
-    if size == want_size && sha_hex == want_sha_hex {
+    if size == want_size {
         MediaFileStatus::Ok
     } else {
-        MediaFileStatus::Mismatch { size, sha256_hex: sha_hex }
+        MediaFileStatus::Mismatch { size }
     }
 }
 
@@ -1214,21 +1214,13 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("good.bin"), b"abc").unwrap();
 
-        // Known sha256 of "abc".
-        let sha_abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(check_file(&dir, Path::new("good.bin"), 3), MediaFileStatus::Ok);
         assert_eq!(
-            check_file(&dir, Path::new("good.bin"), 3, sha_abc),
-            MediaFileStatus::Ok
-        );
-        assert_eq!(
-            check_file(&dir, Path::new("absent.bin"), 3, sha_abc),
+            check_file(&dir, Path::new("absent.bin"), 3),
             MediaFileStatus::Missing
         );
-        match check_file(&dir, Path::new("good.bin"), 3, "0000") {
-            MediaFileStatus::Mismatch { size, sha256_hex } => {
-                assert_eq!(size, 3);
-                assert_eq!(sha256_hex, sha_abc);
-            }
+        match check_file(&dir, Path::new("good.bin"), 999) {
+            MediaFileStatus::Mismatch { size } => assert_eq!(size, 3),
             other => panic!("expected mismatch, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
