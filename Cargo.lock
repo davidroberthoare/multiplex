@@ -1897,7 +1897,7 @@ checksum = "956787520e75e9bd233246045d19f42fb73242759cc57fba9611d940ae96d4b0"
 
 [[package]]
 name = "multiplex-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "multiplex-controller"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1947,7 +1947,7 @@ dependencies = [
 
 [[package]]
 name = "multiplex-media"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "gstreamer",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "multiplex-shared"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2476,7 +2476,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playback-spike"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "eframe",
